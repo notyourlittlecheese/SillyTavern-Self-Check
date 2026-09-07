@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.0';
+const STSC_VERSION = '0.4.1';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -25,21 +25,24 @@ const STSC_BUILTIN_GENERAL_KEY = 'default-general-core-v1';
 const STSC_BUILTIN_GENERAL_NAME = '默认通用自检';
 const STSC_UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
 const STSC_REMOTE_MANIFEST_URLS = Object.freeze([
-    'https://raw.githubusercontent.com/chenxyeah/SillyTavern-Self-Check/main/manifest.json',
-    'https://cdn.jsdelivr.net/gh/chenxyeah/SillyTavern-Self-Check@main/manifest.json',
-    'https://api.github.com/repos/chenxyeah/SillyTavern-Self-Check/contents/manifest.json?ref=main',
+    'https://raw.githubusercontent.com/notyourlittlecheese/SillyTavern-Self-Check/main/manifest.json',
+    'https://cdn.jsdelivr.net/gh/notyourlittlecheese/SillyTavern-Self-Check@main/manifest.json',
+    'https://api.github.com/repos/notyourlittlecheese/SillyTavern-Self-Check/contents/manifest.json?ref=main',
 ]);
 const STSC_REMOTE_RELEASE_URLS = Object.freeze([
-    'https://raw.githubusercontent.com/chenxyeah/SillyTavern-Self-Check/main/version.json',
-    'https://cdn.jsdelivr.net/gh/chenxyeah/SillyTavern-Self-Check@main/version.json',
-    'https://api.github.com/repos/chenxyeah/SillyTavern-Self-Check/contents/version.json?ref=main',
+    'https://raw.githubusercontent.com/notyourlittlecheese/SillyTavern-Self-Check/main/version.json',
+    'https://cdn.jsdelivr.net/gh/notyourlittlecheese/SillyTavern-Self-Check@main/version.json',
+    'https://api.github.com/repos/notyourlittlecheese/SillyTavern-Self-Check/contents/version.json?ref=main',
 ]);
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-09-03',
-    title: 'DEV 功能正式迁入：双API、复盘与可靠性升级',
+    releasedAt: '2026-09-07',
+    title: '双API备用接口轮询',
     changes: Object.freeze([
+        '双API新增备用自检API列表：主接口失败后会按顺序尝试备用接口。',
+        '备用API可单独设置接口地址、模型、密钥、启用状态和优先顺序。',
+        '自检API全部失败时，运行日志会汇总每个接口的失败原因。',
         '正式整合 beta.22 已验证功能：双API自检、上一轮复盘、强力YAML规范、运行日志与插件内更新。',
         '沿用正式版预设和角色绑定；可在插件设置中从同一酒馆的DEV迁入配置，并恢复迁入前的正式版设置。',
         '单API提示词新增严格输出边界：原有思维链必须先完整闭合，自检和最终正文必须位于思维链标签之外。',
@@ -108,6 +111,7 @@ const DEFAULT_SETTINGS = Object.freeze({
         endpoint: '',
         apiKey: '',
         model: '',
+        fallbacks: [],
         maxTokens: 4096,
         timeoutSeconds: 150,
         retryTransient: true,
@@ -377,6 +381,16 @@ function normalizeSettings() {
     settings.dualApi.endpoint = String(settings.dualApi.endpoint || '');
     settings.dualApi.apiKey = String(settings.dualApi.apiKey || '');
     settings.dualApi.model = String(settings.dualApi.model || '');
+    if (!Array.isArray(settings.dualApi.fallbacks)) settings.dualApi.fallbacks = [];
+    settings.dualApi.fallbacks = settings.dualApi.fallbacks
+        .filter(item => item && typeof item === 'object')
+        .map(item => ({
+            id: String(item.id || uid('api')),
+            endpoint: String(item.endpoint || ''),
+            apiKey: String(item.apiKey || ''),
+            model: String(item.model || ''),
+            enabled: item.enabled !== false,
+        }));
     settings.dualApi.maxTokens = clampNumber(settings.dualApi.maxTokens, 256, 12000, 4096);
     settings.dualApi.timeoutSeconds = clampNumber(settings.dualApi.timeoutSeconds, 60, 300, 150);
     settings.dualApi.retryTransient = Boolean(settings.dualApi.retryTransient);
@@ -944,6 +958,40 @@ function dualApiModelStatusText(dual) {
     if (dualApiModelsError) return dualApiModelsError;
     if (dualApiModels.length) return `已获取 ${dualApiModels.length} 个可用模型。`;
     return '等待自动获取模型列表。';
+}
+
+function dualApiFallbacksHtml(dual) {
+    const fallbacks = Array.isArray(dual.fallbacks) ? dual.fallbacks : [];
+    if (!fallbacks.length) {
+        return '<div class="stsc-empty stsc-fallback-empty">尚未添加备用自检API。主API失败时不会切换线路。</div>';
+    }
+
+    return fallbacks.map((item, index) => `
+        <div class="stsc-fallback-api-card" data-fallback-index="${index}">
+            <div class="stsc-fallback-api-head">
+                <label class="checkbox_label"><input type="checkbox" data-dual-fallback-field="enabled" ${item.enabled !== false ? 'checked' : ''}> 启用备用API ${index + 1}</label>
+                <div class="stsc-compact-row">
+                    <button class="menu_button stsc-small-button stsc-icon-action" type="button" data-action="move-dual-fallback-up" title="上移" aria-label="上移" ${index === 0 ? 'disabled' : ''}><i class="fa-solid fa-arrow-up"></i><span class="stsc-action-label">上移</span></button>
+                    <button class="menu_button stsc-small-button stsc-icon-action" type="button" data-action="move-dual-fallback-down" title="下移" aria-label="下移" ${index === fallbacks.length - 1 ? 'disabled' : ''}><i class="fa-solid fa-arrow-down"></i><span class="stsc-action-label">下移</span></button>
+                    <button class="menu_button stsc-small-button stsc-danger-button stsc-icon-action" type="button" data-action="delete-dual-fallback" title="删除备用API" aria-label="删除备用API"><i class="fa-solid fa-trash-can"></i><span class="stsc-action-label">删除</span></button>
+                </div>
+            </div>
+            <div class="stsc-grid-3" style="margin-top:9px">
+                <div class="stsc-field">
+                    <label>接口地址</label>
+                    <input class="text_pole" type="text" autocomplete="off" data-dual-fallback-field="endpoint" placeholder="https://example.com/v1" value="${escapeHtml(item.endpoint)}">
+                </div>
+                <div class="stsc-field">
+                    <label>模型</label>
+                    <input class="text_pole" type="text" autocomplete="off" data-dual-fallback-field="model" placeholder="例如：gpt-4.1-mini" value="${escapeHtml(item.model)}">
+                </div>
+                <div class="stsc-field">
+                    <label>API密钥</label>
+                    <input class="text_pole" type="password" autocomplete="new-password" data-dual-fallback-field="apiKey" placeholder="sk-…" value="${escapeHtml(item.apiKey)}">
+                </div>
+            </div>
+        </div>
+    `).join('');
 }
 
 function updateDualApiModelControl() {
@@ -2165,16 +2213,43 @@ function waitForDualApiRetry(milliseconds) {
     return new Promise(resolve => setTimeout(resolve, milliseconds));
 }
 
-async function callDualApiSelfCheck(
+function getDualApiCandidates(dual) {
+    const candidates = [{
+        label: '主自检API',
+        endpoint: dual.endpoint,
+        apiKey: dual.apiKey,
+        model: dual.model,
+    }];
+
+    const fallbacks = Array.isArray(dual.fallbacks) ? dual.fallbacks : [];
+    fallbacks.forEach((item, index) => {
+        if (!item || item.enabled === false) return;
+        candidates.push({
+            label: `备用自检API ${index + 1}`,
+            endpoint: item.endpoint,
+            apiKey: item.apiKey,
+            model: item.model,
+        });
+    });
+
+    return candidates
+        .map(candidate => ({
+            ...candidate,
+            endpoint: normalizeDualApiBaseUrl(candidate.endpoint),
+            model: String(candidate.model || '').trim(),
+            apiKey: String(candidate.apiKey || ''),
+        }))
+        .filter(candidate => candidate.endpoint && candidate.model);
+}
+
+async function callDualApiCandidate(
+    candidate,
     { chat, questions, references, temporaryInstructions, settings },
     { compact = false, allowTransientRetry = true, timeoutSecondsOverride = 0 } = {},
 ) {
     const dual = settings.dualApi;
-    const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
-    const model = String(dual.model || '').trim();
-    if (!endpoint) throw new Error('尚未填写有效的自检API接口地址。');
-    if (!model) throw new Error('尚未选择自检模型。请先在设置页获取并选择模型，然后保存。');
-
+    const endpoint = candidate.endpoint;
+    const model = candidate.model;
     const context = ctx();
     const configuredTimeout = clampNumber(timeoutSecondsOverride || dual.timeoutSeconds, 60, 300, 150);
     const maxAttempts = allowTransientRetry && dual.retryTransient ? 2 : 1;
@@ -2209,7 +2284,7 @@ async function callDualApiSelfCheck(
                     stream: false,
                     chat_completion_source: 'openai',
                     reverse_proxy: endpoint,
-                    proxy_password: String(dual.apiKey || ''),
+                    proxy_password: candidate.apiKey,
                     include_reasoning: false,
                 }),
             });
@@ -2236,7 +2311,7 @@ async function callDualApiSelfCheck(
                 error.transient = true;
                 throw error;
             }
-            return { text, attempts: attempt + 1, compact: attemptCompact };
+            return { text, attempts: attempt + 1, compact: attemptCompact, apiLabel: candidate.label };
         } catch (caught) {
             let error = caught instanceof Error ? caught : new Error(String(caught || '未知错误'));
             if (error.name === 'AbortError') {
@@ -2248,6 +2323,7 @@ async function callDualApiSelfCheck(
             }
             error.elapsedMs = Date.now() - startedAt;
             error.attempts = attempt + 1;
+            error.apiLabel = candidate.label;
             lastError = error;
 
             if (attempt + 1 >= maxAttempts || !isTransientDualApiFailure(error)) break;
@@ -2258,9 +2334,52 @@ async function callDualApiSelfCheck(
     }
 
     if (lastError && maxAttempts > 1 && lastError.attempts > 1) {
-        lastError.message = `${lastError.message}（已自动精简重试1次，仍未成功）`;
+        lastError.message = `${lastError.message}（${candidate.label}已自动精简重试1次，仍未成功）`;
     }
     throw lastError || new Error('自检API调用失败。');
+}
+
+async function callDualApiSelfCheck(
+    { chat, questions, references, temporaryInstructions, settings },
+    { compact = false, allowTransientRetry = true, timeoutSecondsOverride = 0 } = {},
+) {
+    const dual = settings.dualApi;
+    const candidates = getDualApiCandidates(dual);
+    if (!candidates.length) {
+        const hasEndpoint = normalizeDualApiBaseUrl(dual.endpoint);
+        if (!hasEndpoint) throw new Error('尚未填写有效的自检API接口地址。');
+        throw new Error('尚未选择自检模型。请先在设置页获取并选择模型，或为备用API填写模型名称，然后保存。');
+    }
+
+    const failures = [];
+    for (let index = 0; index < candidates.length; index++) {
+        const candidate = candidates[index];
+        try {
+            const result = await callDualApiCandidate(candidate, { chat, questions, references, temporaryInstructions, settings }, { compact, allowTransientRetry, timeoutSecondsOverride });
+            if (index > 0) {
+                addRuntimeLog('warning', '自检API', `${candidate.label}调用成功；前面的接口失败，已自动切换。`, failures.map(item => `${item.label}：${item.message}`).join('；'));
+            }
+            return {
+                ...result,
+                failedApis: failures,
+            };
+        } catch (caught) {
+            const error = caught instanceof Error ? caught : new Error(String(caught || '未知错误'));
+            failures.push({
+                label: candidate.label,
+                message: error.message || '未知错误',
+            });
+            if (index + 1 < candidates.length) {
+                Logger.warn(`[STSC] ${candidate.label}失败，准备尝试下一个自检API：`, error);
+            }
+        }
+    }
+
+    const last = failures[failures.length - 1];
+    const error = new Error(`所有自检API都调用失败。${failures.map(item => `${item.label}：${item.message}`).join('；')}`);
+    error.failedApis = failures;
+    error.apiLabel = last?.label || '';
+    throw error;
 }
 
 function dualApiAnswerRows(questions, parsed) {
@@ -3568,6 +3687,17 @@ function renderSettingsTab() {
                 <div class="stsc-muted">密钥保存在当前酒馆的插件设置中，不会写入导出的预设或资料库文件。</div>
             </div>
 
+            <div class="stsc-field" style="margin-top:12px">
+                <div class="stsc-section-title stsc-section-title-row">
+                    <span>备用自检API</span>
+                    <button class="menu_button stsc-small-button" type="button" data-action="add-dual-fallback">＋ 添加备用API</button>
+                </div>
+                <div class="stsc-muted">主自检API失败后，会按这里的顺序继续尝试。备用API需手动填写模型名称；未启用或缺少接口/模型的条目会跳过。</div>
+                <div id="stsc_dual_fallback_list" class="stsc-fallback-api-list">
+                    ${dualApiFallbacksHtml(dual)}
+                </div>
+            </div>
+
             <div class="stsc-grid-3" style="margin-top:10px">
                 <div class="stsc-field">
                     <label>自检最大回复长度</label>
@@ -4861,6 +4991,58 @@ function bindUiEvents() {
         input.type = showing ? 'password' : 'text';
         $(this).text(showing ? '显示' : '隐藏');
     });
+    $('#stsc_manager_overlay').on('input change', '[data-dual-fallback-field]', function (event) {
+        const card = this.closest('[data-fallback-index]');
+        const index = Number(card?.dataset?.fallbackIndex);
+        const field = String(this.dataset.dualFallbackField || '');
+        const fallback = getUiSettings().dualApi.fallbacks?.[index];
+        if (!fallback || !['endpoint', 'model', 'apiKey', 'enabled'].includes(field)) return;
+
+        if (field === 'enabled') {
+            fallback.enabled = this.checked;
+        } else {
+            fallback[field] = this.value;
+            if (field === 'endpoint' && event.type === 'change') {
+                const normalized = normalizeDualApiBaseUrl(this.value);
+                if (normalized) {
+                    fallback.endpoint = normalized;
+                    this.value = normalized;
+                }
+            }
+        }
+        markDirty();
+    });
+    $('#stsc_manager_overlay').on('click', '[data-action="add-dual-fallback"]', function () {
+        const dual = getUiSettings().dualApi;
+        dual.fallbacks = Array.isArray(dual.fallbacks) ? dual.fallbacks : [];
+        dual.fallbacks.push({ id: uid('api'), endpoint: '', apiKey: '', model: '', enabled: true });
+        markDirty();
+        renderSettingsTab();
+        updateSaveState();
+    });
+    $('#stsc_manager_overlay').on('click', '[data-action="delete-dual-fallback"]', function () {
+        const card = this.closest('[data-fallback-index]');
+        const index = Number(card?.dataset?.fallbackIndex);
+        const fallbacks = getUiSettings().dualApi.fallbacks;
+        if (!Array.isArray(fallbacks) || index < 0 || index >= fallbacks.length) return;
+        fallbacks.splice(index, 1);
+        markDirty();
+        renderSettingsTab();
+        updateSaveState();
+    });
+    $('#stsc_manager_overlay').on('click', '[data-action="move-dual-fallback-up"], [data-action="move-dual-fallback-down"]', function () {
+        const card = this.closest('[data-fallback-index]');
+        const index = Number(card?.dataset?.fallbackIndex);
+        const fallbacks = getUiSettings().dualApi.fallbacks;
+        if (!Array.isArray(fallbacks)) return;
+        const delta = this.dataset.action === 'move-dual-fallback-up' ? -1 : 1;
+        const next = index + delta;
+        if (index < 0 || next < 0 || index >= fallbacks.length || next >= fallbacks.length) return;
+        [fallbacks[index], fallbacks[next]] = [fallbacks[next], fallbacks[index]];
+        markDirty();
+        renderSettingsTab();
+        updateSaveState();
+    });
     $('#stsc_manager_overlay').on('change', '#stsc_dual_max_tokens', function () {
         getUiSettings().dualApi.maxTokens = clampNumber(this.value, 256, 12000, 4096);
         this.value = Math.round(getUiSettings().dualApi.maxTokens);
@@ -5469,7 +5651,7 @@ function openExtensionManagerForUpdate() {
     setTimeout(() => {
         const retryButton = document.querySelector('#extensions_details');
         if (retryButton) retryButton.click();
-        else window.open('https://github.com/chenxyeah/SillyTavern-Self-Check', '_blank', 'noopener,noreferrer');
+        else window.open('https://github.com/notyourlittlecheese/SillyTavern-Self-Check', '_blank', 'noopener,noreferrer');
     }, 150);
 }
 

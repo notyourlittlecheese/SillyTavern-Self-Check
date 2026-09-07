@@ -2436,6 +2436,33 @@ body.stsc-modal-open {
     background: color-mix(in srgb, var(--SmartThemeBlurTintColor, #222) 35%, transparent);
 }
 
+.stsc-fallback-api-list {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    margin-top: 10px;
+}
+
+.stsc-fallback-api-card {
+    min-width: 0;
+    padding: 10px;
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor, #888) 42%, transparent);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--SmartThemeBlurTintColor, #222) 10%, transparent);
+}
+
+.stsc-fallback-api-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.stsc-fallback-empty {
+    margin-top: 8px;
+}
+
 @media (max-width: 700px) {
     .stsc-dual-branch-grid {
         grid-template-columns: 1fr;
@@ -2450,6 +2477,11 @@ body.stsc-modal-open {
     }
 
     .stsc-section-title-row {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .stsc-fallback-api-head {
         align-items: flex-start;
         flex-direction: column;
     }

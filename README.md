@@ -2,13 +2,19 @@
 
 一个用于 SillyTavern 角色扮演的写作前置自检、预设管理、参考资料注入与临时指令插件。
 
-> 当前正式版本：`0.4.0`
+> 当前正式版本：`0.4.1`
+
+## v0.4.1 更新
+
+- 双 API 新增备用自检 API 列表，主接口失败后会按顺序尝试备用接口。
+- 每个备用 API 可单独设置接口地址、模型、密钥、启用状态和优先顺序。
+- 全部自检 API 都失败时，运行日志会汇总每个接口的失败原因，方便排查是哪条线路不可用。
 
 ## v0.4.0 更新
 
 完整迁入 DEV `0.4.0-beta.22` 的功能，并适配正式版的安装目录、配置、输出标签和更新地址。
 
-- 双 API：独立接口完成自检，再交由酒馆主 API 输出正文，支持模型列表、超时、精简重试与失败回退。
+- 双 API：独立接口完成自检，再交由酒馆主 API 输出正文，支持模型列表、多个备用接口、超时、精简重试与失败回退。
 - 上一轮复盘：连续成功的双 API 生成可核对上一轮自检和正文；漏复盘时记录状态，不阻断本轮正文。
 - 强力规范：将自检结论转成 YAML，以 System、depth 0 临时注入，正文仍须位于推理标签之外。
 - 思维链边界修复：仅在自检提供可靠分界时分开错误包裹的正文；正常推理及酒馆独立保存的 reasoning 数据保留。
@@ -163,7 +169,7 @@
 3. 点击“安装扩展”。
 4. 粘贴仓库地址：
 
-   `https://github.com/chenxyeah/SillyTavern-Self-Check.git`
+   `https://github.com/notyourlittlecheese/SillyTavern-Self-Check.git`
 
 5. 安装完成后刷新 SillyTavern。
 
@@ -219,7 +225,7 @@
 
 可在 GitHub 仓库的 Issues 页面提交：
 
-`https://github.com/chenxyeah/SillyTavern-Self-Check/issues`
+`https://github.com/notyourlittlecheese/SillyTavern-Self-Check/issues`
 
 ## 许可证
 
