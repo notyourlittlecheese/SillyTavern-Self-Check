@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.1';
+const STSC_VERSION = '0.4.2';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -38,8 +38,10 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-09-07',
-    title: '双API备用接口轮询',
+    title: '双API多模型与备用接口轮询',
     changes: Object.freeze([
+        '主自检API和备用自检API均支持刷新模型列表并多选模型。',
+        '同一个API配置选择多个模型时，会按选中顺序逐个尝试。',
         '双API新增备用自检API列表：主接口失败后会按顺序尝试备用接口。',
         '备用API可单独设置接口地址、模型、密钥、启用状态和优先顺序。',
         '自检API全部失败时，运行日志会汇总每个接口的失败原因。',
@@ -111,6 +113,7 @@ const DEFAULT_SETTINGS = Object.freeze({
         endpoint: '',
         apiKey: '',
         model: '',
+        models: [],
         fallbacks: [],
         maxTokens: 4096,
         timeoutSeconds: 150,
@@ -198,6 +201,8 @@ let dualApiModelsLoading = false;
 let dualApiModelsError = '';
 let dualApiModelsSignature = '';
 let dualApiModelFetchTimer = null;
+let dualApiFallbackModelStates = new Map();
+let dualApiFallbackModelTimers = new Map();
 
 function sanitizeLogText(value) {
     return String(value ?? '')
@@ -381,16 +386,29 @@ function normalizeSettings() {
     settings.dualApi.endpoint = String(settings.dualApi.endpoint || '');
     settings.dualApi.apiKey = String(settings.dualApi.apiKey || '');
     settings.dualApi.model = String(settings.dualApi.model || '');
+    settings.dualApi.models = Array.isArray(settings.dualApi.models)
+        ? settings.dualApi.models.map(value => String(value || '').trim()).filter(Boolean)
+        : [];
+    if (!settings.dualApi.models.length && settings.dualApi.model) {
+        settings.dualApi.models = [settings.dualApi.model];
+    }
     if (!Array.isArray(settings.dualApi.fallbacks)) settings.dualApi.fallbacks = [];
     settings.dualApi.fallbacks = settings.dualApi.fallbacks
         .filter(item => item && typeof item === 'object')
-        .map(item => ({
-            id: String(item.id || uid('api')),
-            endpoint: String(item.endpoint || ''),
-            apiKey: String(item.apiKey || ''),
-            model: String(item.model || ''),
-            enabled: item.enabled !== false,
-        }));
+        .map(item => {
+            const model = String(item.model || '');
+            const models = Array.isArray(item.models)
+                ? item.models.map(value => String(value || '').trim()).filter(Boolean)
+                : [];
+            return {
+                id: String(item.id || uid('api')),
+                endpoint: String(item.endpoint || ''),
+                apiKey: String(item.apiKey || ''),
+                model,
+                models: models.length ? models : (model ? [model] : []),
+                enabled: item.enabled !== false,
+            };
+        });
     settings.dualApi.maxTokens = clampNumber(settings.dualApi.maxTokens, 256, 12000, 4096);
     settings.dualApi.timeoutSeconds = clampNumber(settings.dualApi.timeoutSeconds, 60, 300, 150);
     settings.dualApi.retryTransient = Boolean(settings.dualApi.retryTransient);
@@ -904,6 +922,27 @@ function dualApiConnectionSignature(dual = getUiSettings()?.dualApi) {
     return `${normalizeDualApiBaseUrl(dual.endpoint)}\n${String(dual.apiKey || '')}`;
 }
 
+function dualApiConfigSignature(config) {
+    if (!config) return '';
+    return `${normalizeDualApiBaseUrl(config.endpoint)}\n${String(config.apiKey || '')}`;
+}
+
+function selectedDualApiModels(config) {
+    const models = Array.isArray(config?.models)
+        ? config.models.map(value => String(value || '').trim()).filter(Boolean)
+        : [];
+    const legacy = String(config?.model || '').trim();
+    return [...new Set(models.length ? models : (legacy ? [legacy] : []))];
+}
+
+function setSelectedDualApiModels(config, models) {
+    const selected = [...new Set((Array.isArray(models) ? models : [])
+        .map(value => String(value || '').trim())
+        .filter(Boolean))];
+    config.models = selected;
+    config.model = selected[0] || '';
+}
+
 function extractDualApiModelIds(payload) {
     const candidates = [
         payload?.data,
@@ -925,14 +964,14 @@ function extractDualApiModelIds(payload) {
 
 function dualApiModelOptionsHtml(dual) {
     const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
-    const savedModel = String(dual.model || '');
+    const savedModels = selectedDualApiModels(dual);
 
     if (dualApiModelsLoading) {
         return '<option value="">正在获取模型列表……</option>';
     }
 
     if (dualApiModels.length) {
-        return dualApiModels.map(model => `<option value="${escapeHtml(model)}" ${model === savedModel ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+        return dualApiModels.map(model => `<option value="${escapeHtml(model)}" ${savedModels.includes(model) ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
     }
 
     if (!endpoint) {
@@ -940,12 +979,12 @@ function dualApiModelOptionsHtml(dual) {
     }
 
     if (dualApiModelsError) {
-        const saved = savedModel ? `<option value="${escapeHtml(savedModel)}" selected>${escapeHtml(savedModel)}（上次选择）</option>` : '';
+        const saved = savedModels.map(model => `<option value="${escapeHtml(model)}" selected>${escapeHtml(model)}（上次选择）</option>`).join('');
         return `${saved}<option value="" ${saved ? '' : 'selected'}>模型获取失败，请检查接口</option>`;
     }
 
-    if (savedModel) {
-        return `<option value="${escapeHtml(savedModel)}" selected>${escapeHtml(savedModel)}（等待刷新）</option>`;
+    if (savedModels.length) {
+        return savedModels.map(model => `<option value="${escapeHtml(model)}" selected>${escapeHtml(model)}（等待刷新）</option>`).join('');
     }
 
     return '<option value="">模型将自动获取</option>';
@@ -956,8 +995,47 @@ function dualApiModelStatusText(dual) {
     if (!endpoint) return '填写接口地址后，插件会自动读取该接口提供的模型列表。';
     if (dualApiModelsLoading) return '正在连接接口并读取模型列表……';
     if (dualApiModelsError) return dualApiModelsError;
-    if (dualApiModels.length) return `已获取 ${dualApiModels.length} 个可用模型。`;
+    if (dualApiModels.length) return `已获取 ${dualApiModels.length} 个可用模型，可按住 Ctrl/Command 多选。`;
     return '等待自动获取模型列表。';
+}
+
+function fallbackModelState(item) {
+    const id = String(item?.id || '');
+    if (!id) return { models: [], loading: false, error: '', signature: '' };
+    if (!dualApiFallbackModelStates.has(id)) {
+        dualApiFallbackModelStates.set(id, { models: [], loading: false, error: '', signature: '' });
+    }
+    return dualApiFallbackModelStates.get(id);
+}
+
+function dualApiFallbackModelOptionsHtml(item) {
+    const endpoint = normalizeDualApiBaseUrl(item.endpoint);
+    const savedModels = selectedDualApiModels(item);
+    const state = fallbackModelState(item);
+
+    if (state.loading) return '<option value="">正在获取模型列表……</option>';
+    if (state.models.length) {
+        return state.models.map(model => `<option value="${escapeHtml(model)}" ${savedModels.includes(model) ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+    }
+    if (!endpoint) return '<option value="">请先填写接口地址</option>';
+    if (state.error) {
+        const saved = savedModels.map(model => `<option value="${escapeHtml(model)}" selected>${escapeHtml(model)}（上次选择）</option>`).join('');
+        return `${saved}<option value="" ${saved ? '' : 'selected'}>模型获取失败，请检查接口</option>`;
+    }
+    if (savedModels.length) {
+        return savedModels.map(model => `<option value="${escapeHtml(model)}" selected>${escapeHtml(model)}（等待刷新）</option>`).join('');
+    }
+    return '<option value="">模型将自动获取</option>';
+}
+
+function dualApiFallbackModelStatusText(item) {
+    const endpoint = normalizeDualApiBaseUrl(item.endpoint);
+    const state = fallbackModelState(item);
+    if (!endpoint) return '填写接口地址后可刷新模型列表。';
+    if (state.loading) return '正在读取备用API模型列表……';
+    if (state.error) return state.error;
+    if (state.models.length) return `已获取 ${state.models.length} 个可用模型，可按住 Ctrl/Command 多选。`;
+    return '等待刷新模型列表。';
 }
 
 function dualApiFallbacksHtml(dual) {
@@ -983,7 +1061,13 @@ function dualApiFallbacksHtml(dual) {
                 </div>
                 <div class="stsc-field">
                     <label>模型</label>
-                    <input class="text_pole" type="text" autocomplete="off" data-dual-fallback-field="model" placeholder="例如：gpt-4.1-mini" value="${escapeHtml(item.model)}">
+                    <div class="stsc-model-row">
+                        <select class="text_pole stsc-model-multi" multiple size="4" data-dual-fallback-field="models" ${normalizeDualApiBaseUrl(item.endpoint) ? '' : 'disabled'}>
+                            ${dualApiFallbackModelOptionsHtml(item)}
+                        </select>
+                        <button class="menu_button stsc-small-button" type="button" data-action="refresh-dual-fallback-models" ${normalizeDualApiBaseUrl(item.endpoint) ? '' : 'disabled'}>${fallbackModelState(item).loading ? '获取中…' : '刷新模型'}</button>
+                    </div>
+                    <div class="stsc-muted stsc-model-status ${fallbackModelState(item).error ? 'stsc-model-status-error' : ''} ${fallbackModelState(item).models.length && !fallbackModelState(item).error ? 'stsc-model-status-success' : ''}">${escapeHtml(dualApiFallbackModelStatusText(item))}</div>
                 </div>
                 <div class="stsc-field">
                     <label>API密钥</label>
@@ -1006,15 +1090,18 @@ function updateDualApiModelControl() {
 
     select.innerHTML = dualApiModelOptionsHtml(dual);
     const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
-    select.disabled = !endpoint || dualApiModelsLoading || !dualApiModels.length;
+    select.disabled = !endpoint || dualApiModelsLoading;
 
     if (dualApiModels.length) {
-        const selected = dualApiModels.includes(dual.model) ? dual.model : dualApiModels[0];
-        if (dual.model !== selected) {
-            dual.model = selected;
+        const savedModels = selectedDualApiModels(dual).filter(model => dualApiModels.includes(model));
+        const selected = savedModels.length ? savedModels : [dualApiModels[0]];
+        if (selected.join('\n') !== selectedDualApiModels(dual).join('\n')) {
+            setSelectedDualApiModels(dual, selected);
             markDirty();
         }
-        select.value = selected;
+        Array.from(select.options).forEach(option => {
+            option.selected = selected.includes(option.value);
+        });
     }
 
     if (button) {
@@ -1049,6 +1136,41 @@ function scheduleDualApiModelFetch(delay = 650, { force = false, showToast = fal
     }, Math.max(0, Number(delay) || 0));
 }
 
+async function fetchDualApiModelList(config) {
+    const endpoint = normalizeDualApiBaseUrl(config?.endpoint);
+    if (!endpoint) return [];
+
+    const context = ctx();
+    const headers = {
+        'Content-Type': 'application/json',
+        ...(context?.getRequestHeaders?.() || {}),
+    };
+    const response = await fetch('/api/backends/chat-completions/status', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+            chat_completion_source: 'openai',
+            reverse_proxy: endpoint,
+            proxy_password: String(config?.apiKey || ''),
+        }),
+    });
+
+    let payload = {};
+    try {
+        payload = await response.json();
+    } catch {
+        payload = {};
+    }
+
+    const models = extractDualApiModelIds(payload);
+    if (!response.ok || payload?.error || !models.length) {
+        const message = String(payload?.message || payload?.error?.message || '').trim();
+        throw new Error(message || '没有读取到模型列表。请确认填写的是以 /v1 结尾的 OpenAI 兼容接口，并且该接口支持 /models。');
+    }
+
+    return models;
+}
+
 async function fetchDualApiModels({ force = false, showToast = false } = {}) {
     const settings = getUiSettings();
     const dual = settings?.dualApi;
@@ -1075,43 +1197,17 @@ async function fetchDualApiModels({ force = false, showToast = false } = {}) {
     updateDualApiModelControl();
 
     try {
-        const context = ctx();
-        const headers = {
-            'Content-Type': 'application/json',
-            ...(context?.getRequestHeaders?.() || {}),
-        };
-        const response = await fetch('/api/backends/chat-completions/status', {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-                chat_completion_source: 'openai',
-                reverse_proxy: endpoint,
-                proxy_password: String(dual.apiKey || ''),
-            }),
-        });
-
-        let payload = {};
-        try {
-            payload = await response.json();
-        } catch {
-            payload = {};
-        }
-
+        const models = await fetchDualApiModelList(dual);
         if (dualApiConnectionSignature(getUiSettings()?.dualApi) !== signature) {
             return [];
-        }
-
-        const models = extractDualApiModelIds(payload);
-        if (!response.ok || payload?.error || !models.length) {
-            const message = String(payload?.message || payload?.error?.message || '').trim();
-            throw new Error(message || '没有读取到模型列表。请确认填写的是以 /v1 结尾的 OpenAI 兼容接口，并且该接口支持 /models。');
         }
 
         dualApiModels = models;
         dualApiModelsError = '';
         const liveDual = getUiSettings().dualApi;
-        if (!models.includes(liveDual.model)) {
-            liveDual.model = models[0];
+        const selected = selectedDualApiModels(liveDual).filter(model => models.includes(model));
+        if (!selected.length) {
+            setSelectedDualApiModels(liveDual, [models[0]]);
             markDirty();
         }
         if (showToast) toastr.success(`已获取 ${models.length} 个模型。`, '墨提斯之镜');
@@ -1128,6 +1224,77 @@ async function fetchDualApiModels({ force = false, showToast = false } = {}) {
         if (dualApiConnectionSignature(getUiSettings()?.dualApi) === signature) {
             dualApiModelsLoading = false;
             updateDualApiModelControl();
+        }
+    }
+}
+
+function scheduleDualApiFallbackModelFetch(index, delay = 0, { force = false, showToast = false } = {}) {
+    const key = String(index);
+    if (dualApiFallbackModelTimers.has(key)) clearTimeout(dualApiFallbackModelTimers.get(key));
+    const timer = setTimeout(() => {
+        dualApiFallbackModelTimers.delete(key);
+        fetchDualApiFallbackModels(index, { force, showToast });
+    }, Math.max(0, Number(delay) || 0));
+    dualApiFallbackModelTimers.set(key, timer);
+}
+
+async function fetchDualApiFallbackModels(index, { force = false, showToast = false } = {}) {
+    const dual = getUiSettings()?.dualApi;
+    const item = dual?.fallbacks?.[index];
+    if (!item) return [];
+
+    const endpoint = normalizeDualApiBaseUrl(item.endpoint);
+    const state = fallbackModelState(item);
+    if (!endpoint) {
+        state.models = [];
+        state.error = '';
+        state.signature = '';
+        renderSettingsTab();
+        updateSaveState();
+        return [];
+    }
+
+    const signature = dualApiConfigSignature(item);
+    if (!force && signature === state.signature && (state.loading || state.models.length || state.error)) {
+        renderSettingsTab();
+        updateSaveState();
+        return state.models;
+    }
+
+    state.loading = true;
+    state.error = '';
+    state.signature = signature;
+    renderSettingsTab();
+    updateSaveState();
+
+    try {
+        const models = await fetchDualApiModelList(item);
+        const liveItem = getUiSettings()?.dualApi?.fallbacks?.[index];
+        if (!liveItem || dualApiConfigSignature(liveItem) !== signature) return [];
+        const liveState = fallbackModelState(liveItem);
+        liveState.models = models;
+        liveState.error = '';
+        const selected = selectedDualApiModels(liveItem).filter(model => models.includes(model));
+        if (!selected.length) {
+            setSelectedDualApiModels(liveItem, [models[0]]);
+            markDirty();
+        }
+        if (showToast) toastr.success(`备用API ${index + 1} 已获取 ${models.length} 个模型。`, '墨提斯之镜');
+        return models;
+    } catch (error) {
+        const liveItem = getUiSettings()?.dualApi?.fallbacks?.[index];
+        if (!liveItem || dualApiConfigSignature(liveItem) !== signature) return [];
+        const liveState = fallbackModelState(liveItem);
+        liveState.models = [];
+        liveState.error = `模型获取失败：${String(error?.message || error || '未知错误')}`;
+        if (showToast) toastr.error(liveState.error, '墨提斯之镜');
+        return [];
+    } finally {
+        const liveItem = getUiSettings()?.dualApi?.fallbacks?.[index];
+        if (liveItem && dualApiConfigSignature(liveItem) === signature) {
+            fallbackModelState(liveItem).loading = false;
+            renderSettingsTab();
+            updateSaveState();
         }
     }
 }
@@ -2214,32 +2381,42 @@ function waitForDualApiRetry(milliseconds) {
 }
 
 function getDualApiCandidates(dual) {
-    const candidates = [{
+    const configs = [{
         label: '主自检API',
         endpoint: dual.endpoint,
         apiKey: dual.apiKey,
         model: dual.model,
+        models: dual.models,
     }];
 
     const fallbacks = Array.isArray(dual.fallbacks) ? dual.fallbacks : [];
     fallbacks.forEach((item, index) => {
         if (!item || item.enabled === false) return;
-        candidates.push({
+        configs.push({
             label: `备用自检API ${index + 1}`,
             endpoint: item.endpoint,
             apiKey: item.apiKey,
             model: item.model,
+            models: item.models,
         });
     });
 
-    return candidates
-        .map(candidate => ({
-            ...candidate,
-            endpoint: normalizeDualApiBaseUrl(candidate.endpoint),
-            model: String(candidate.model || '').trim(),
-            apiKey: String(candidate.apiKey || ''),
-        }))
-        .filter(candidate => candidate.endpoint && candidate.model);
+    const candidates = [];
+    configs.forEach(config => {
+        const endpoint = normalizeDualApiBaseUrl(config.endpoint);
+        const apiKey = String(config.apiKey || '');
+        if (!endpoint) return;
+        selectedDualApiModels(config).forEach((model, modelIndex) => {
+            candidates.push({
+                label: selectedDualApiModels(config).length > 1 ? `${config.label} / ${model}` : config.label,
+                endpoint,
+                apiKey,
+                model,
+                modelIndex,
+            });
+        });
+    });
+    return candidates;
 }
 
 async function callDualApiCandidate(
@@ -3668,13 +3845,13 @@ function renderSettingsTab() {
                 <div class="stsc-field">
                     <label>自检模型</label>
                     <div class="stsc-model-row">
-                        <select id="stsc_dual_model" class="text_pole" ${dualApiModels.length && !dualApiModelsLoading ? '' : 'disabled'}>
+                        <select id="stsc_dual_model" class="text_pole stsc-model-multi" multiple size="5" ${normalizeDualApiBaseUrl(dual.endpoint) && !dualApiModelsLoading ? '' : 'disabled'}>
                             ${modelOptions}
                         </select>
                         <button id="stsc_refresh_models" class="menu_button stsc-small-button" type="button" ${normalizeDualApiBaseUrl(dual.endpoint) && !dualApiModelsLoading ? '' : 'disabled'}>${dualApiModelsLoading ? '获取中…' : '刷新模型'}</button>
                     </div>
                     <div id="stsc_dual_model_status" class="stsc-muted stsc-model-status ${dualApiModelsError ? 'stsc-model-status-error' : ''} ${dualApiModels.length && !dualApiModelsError ? 'stsc-model-status-success' : ''}">${escapeHtml(dualApiModelStatusText(dual))}</div>
-                    <div class="stsc-muted">模型列表会根据接口自动拉取，不需要手动输入模型名称。</div>
+                    <div class="stsc-muted">模型列表会根据接口自动拉取；可按住 Ctrl/Command 多选，同一接口会按选中顺序依次尝试模型。</div>
                 </div>
             </div>
 
@@ -4969,8 +5146,9 @@ function bindUiEvents() {
         if (normalizeDualApiBaseUrl(dual.endpoint)) scheduleDualApiModelFetch(event.type === 'change' ? 0 : 800);
     });
     $('#stsc_manager_overlay').on('change', '#stsc_dual_model', function () {
-        if (!dualApiModels.includes(this.value)) return;
-        getUiSettings().dualApi.model = this.value;
+        const selected = Array.from(this.selectedOptions).map(option => option.value).filter(value => dualApiModels.includes(value));
+        if (!selected.length) return;
+        setSelectedDualApiModels(getUiSettings().dualApi, selected);
         markDirty();
     });
     $('#stsc_manager_overlay').on('input change', '#stsc_dual_api_key', function (event) {
@@ -5000,6 +5178,11 @@ function bindUiEvents() {
 
         if (field === 'enabled') {
             fallback.enabled = this.checked;
+        } else if (field === 'models') {
+            const state = fallbackModelState(fallback);
+            const selected = Array.from(this.selectedOptions).map(option => option.value).filter(value => !state.models.length || state.models.includes(value));
+            if (!selected.length) return;
+            setSelectedDualApiModels(fallback, selected);
         } else {
             fallback[field] = this.value;
             if (field === 'endpoint' && event.type === 'change') {
@@ -5009,22 +5192,39 @@ function bindUiEvents() {
                     this.value = normalized;
                 }
             }
+            if (field === 'endpoint' || field === 'apiKey') {
+                const state = fallbackModelState(fallback);
+                state.models = [];
+                state.error = '';
+                state.signature = '';
+                if (field === 'endpoint' && normalizeDualApiBaseUrl(fallback.endpoint)) {
+                    scheduleDualApiFallbackModelFetch(index, event.type === 'change' ? 0 : 800);
+                }
+            }
         }
         markDirty();
     });
     $('#stsc_manager_overlay').on('click', '[data-action="add-dual-fallback"]', function () {
         const dual = getUiSettings().dualApi;
         dual.fallbacks = Array.isArray(dual.fallbacks) ? dual.fallbacks : [];
-        dual.fallbacks.push({ id: uid('api'), endpoint: '', apiKey: '', model: '', enabled: true });
+        dual.fallbacks.push({ id: uid('api'), endpoint: '', apiKey: '', model: '', models: [], enabled: true });
         markDirty();
         renderSettingsTab();
         updateSaveState();
+    });
+    $('#stsc_manager_overlay').on('click', '[data-action="refresh-dual-fallback-models"]', function () {
+        const card = this.closest('[data-fallback-index]');
+        const index = Number(card?.dataset?.fallbackIndex);
+        if (!Number.isInteger(index)) return;
+        scheduleDualApiFallbackModelFetch(index, 0, { force: true, showToast: true });
     });
     $('#stsc_manager_overlay').on('click', '[data-action="delete-dual-fallback"]', function () {
         const card = this.closest('[data-fallback-index]');
         const index = Number(card?.dataset?.fallbackIndex);
         const fallbacks = getUiSettings().dualApi.fallbacks;
         if (!Array.isArray(fallbacks) || index < 0 || index >= fallbacks.length) return;
+        const removed = fallbacks[index];
+        if (removed?.id) dualApiFallbackModelStates.delete(String(removed.id));
         fallbacks.splice(index, 1);
         markDirty();
         renderSettingsTab();

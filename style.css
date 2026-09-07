@@ -2362,6 +2362,10 @@ body.stsc-modal-open {
     white-space: nowrap;
 }
 
+.stsc-model-multi {
+    min-height: 7.5em;
+}
+
 .stsc-model-status {
     min-height: 1.35em;
     margin-top: 5px;
