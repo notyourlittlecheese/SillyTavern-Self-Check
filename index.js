@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.5';
+const STSC_VERSION = '0.4.6';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -114,6 +114,7 @@ const DEFAULT_SETTINGS = Object.freeze({
         apiKey: '',
         model: '',
         models: [],
+        primaryIndex: 0,
         fallbacks: [],
         maxTokens: 4096,
         timeoutSeconds: 150,
@@ -412,6 +413,7 @@ function normalizeSettings() {
                 enabled: item.enabled !== false,
             };
         });
+    settings.dualApi.primaryIndex = clampNumber(settings.dualApi.primaryIndex, 0, settings.dualApi.fallbacks.length, 0);
     settings.dualApi.maxTokens = clampNumber(settings.dualApi.maxTokens, 256, 12000, 4096);
     settings.dualApi.timeoutSeconds = clampNumber(settings.dualApi.timeoutSeconds, 60, 300, 150);
     settings.dualApi.retryTransient = Boolean(settings.dualApi.retryTransient);
@@ -1008,6 +1010,27 @@ function dualApiSelectedModelsHtml(config) {
     `;
 }
 
+function dualApiChannelRoleHtml(dual, channelIndex) {
+    const primaryIndex = clampNumber(dual.primaryIndex, 0, Array.isArray(dual.fallbacks) ? dual.fallbacks.length : 0, 0);
+    if (primaryIndex === channelIndex) return '<span class="stsc-status-pill stsc-primary-channel-pill">主渠道</span>';
+    return `<button class="menu_button stsc-small-button" type="button" data-action="set-dual-primary-channel" data-channel-index="${channelIndex}">设为主渠道</button>`;
+}
+
+function dualApiExecutionOrderHtml(dual) {
+    const channels = orderedDualApiChannelConfigs(dual);
+    const parts = channels
+        .filter(channel => normalizeDualApiBaseUrl(channel.endpoint) && selectedDualApiModels(channel).length)
+        .map(channel => `${channel.label}（${selectedDualApiModels(channel).length}模型）`);
+    if (!parts.length) return '<div id="stsc_dual_order" class="stsc-dual-order stsc-muted">当前还没有可执行的自检渠道。</div>';
+    return `<div id="stsc_dual_order" class="stsc-dual-order"><span class="stsc-muted">执行顺序：</span>${parts.map(part => `<span class="stsc-status-pill">${escapeHtml(part)}</span>`).join('')}</div>`;
+}
+
+function updateDualApiExecutionOrder() {
+    const element = document.getElementById('stsc_dual_order');
+    const dual = getUiSettings()?.dualApi;
+    if (element && dual) element.outerHTML = dualApiExecutionOrderHtml(dual);
+}
+
 function dualApiModelOptionsHtml(dual) {
     return dualApiModelChoicesHtml(dual, dualApiModels, { loading: dualApiModelsLoading, error: dualApiModelsError }, 'data-dual-model-option="primary"');
 }
@@ -1063,7 +1086,10 @@ function dualApiFallbacksHtml(dual) {
             </div>
             <div class="stsc-grid-3" style="margin-top:9px">
                 <div class="stsc-field">
-                    <label>接口地址</label>
+                    <div class="stsc-channel-label-row">
+                        <label>接口地址</label>
+                        ${dualApiChannelRoleHtml(dual, index + 1)}
+                    </div>
                     <input class="text_pole" type="text" autocomplete="off" data-dual-fallback-field="endpoint" placeholder="https://example.com/v1" value="${escapeHtml(item.endpoint)}">
                 </div>
                 <div class="stsc-field">
@@ -2419,29 +2445,44 @@ function waitForDualApiRetry(milliseconds) {
     return new Promise(resolve => setTimeout(resolve, milliseconds));
 }
 
-function getDualApiCandidates(dual) {
-    const configs = [{
-        label: '主自检API',
+function dualApiChannelConfigs(dual) {
+    const channels = [{
+        channelIndex: 0,
+        label: '主API配置',
         endpoint: dual.endpoint,
         apiKey: dual.apiKey,
         model: dual.model,
         models: dual.models,
+        enabled: true,
     }];
 
     const fallbacks = Array.isArray(dual.fallbacks) ? dual.fallbacks : [];
     fallbacks.forEach((item, index) => {
         if (!item || item.enabled === false) return;
-        configs.push({
-            label: `备用自检API ${index + 1}`,
+        channels.push({
+            channelIndex: index + 1,
+            label: `备用API ${index + 1}`,
             endpoint: item.endpoint,
             apiKey: item.apiKey,
             model: item.model,
             models: item.models,
+            enabled: true,
         });
     });
+    return channels;
+}
 
+function orderedDualApiChannelConfigs(dual) {
+    const channels = dualApiChannelConfigs(dual);
+    if (!channels.length) return [];
+    const primaryIndex = clampNumber(dual.primaryIndex, 0, Array.isArray(dual.fallbacks) ? dual.fallbacks.length : 0, 0);
+    const primaryOffset = Math.max(0, channels.findIndex(channel => channel.channelIndex === primaryIndex));
+    return channels.slice(primaryOffset).concat(channels.slice(0, primaryOffset));
+}
+
+function getDualApiCandidates(dual) {
     const candidates = [];
-    configs.forEach(config => {
+    orderedDualApiChannelConfigs(dual).forEach(config => {
         const endpoint = normalizeDualApiBaseUrl(config.endpoint);
         const apiKey = String(config.apiKey || '');
         if (!endpoint) return;
@@ -3986,10 +4027,14 @@ function renderSettingsTab() {
             <div class="stsc-dev-notice">
                 双API核心流程已启用：每次生成会先消耗一次自检API调用，再把自检结果临时交给酒馆主API生成正文。可选择开启上一轮复盘和强力规范。
             </div>
+            ${dualApiExecutionOrderHtml(dual)}
 
             <div class="stsc-grid-2" style="margin-top:12px">
                 <div class="stsc-field">
-                    <label>自检API接口地址</label>
+                    <div class="stsc-channel-label-row">
+                        <label>自检API接口地址</label>
+                        ${dualApiChannelRoleHtml(dual, 0)}
+                    </div>
                     <input id="stsc_dual_endpoint" class="text_pole" type="text" autocomplete="off" placeholder="例如：https://example.com/v1" value="${escapeHtml(dual.endpoint)}">
                     <div class="stsc-muted">填写 OpenAI 兼容接口的基础地址，通常以 <code>/v1</code> 结尾；不要填写 <code>/chat/completions</code>。</div>
                 </div>
@@ -5300,6 +5345,7 @@ function bindUiEvents() {
         }
         markDirty();
         resetDualApiModelState();
+        updateDualApiExecutionOrder();
         if (normalizeDualApiBaseUrl(dual.endpoint)) scheduleDualApiModelFetch(event.type === 'change' ? 0 : 800);
     });
     $('#stsc_manager_overlay').on('change', '[data-dual-model-option="primary"]', function () {
@@ -5313,6 +5359,7 @@ function bindUiEvents() {
         setSelectedDualApiModels(getUiSettings().dualApi, selected);
         markDirty();
         $('#stsc_dual_model_selected').html(dualApiSelectedModelsHtml(getUiSettings().dualApi));
+        updateDualApiExecutionOrder();
     });
     $('#stsc_manager_overlay').on('input', '[data-dual-model-search="primary"]', function () {
         filterDualApiModelChoices(document.getElementById('stsc_dual_model'), this.value);
@@ -5321,6 +5368,7 @@ function bindUiEvents() {
         getUiSettings().dualApi.apiKey = this.value;
         markDirty();
         resetDualApiModelState();
+        updateDualApiExecutionOrder();
         if (normalizeDualApiBaseUrl(getUiSettings().dualApi.endpoint)) {
             scheduleDualApiModelFetch(event.type === 'change' ? 0 : 800);
         }
@@ -5344,6 +5392,11 @@ function bindUiEvents() {
 
         if (field === 'enabled') {
             fallback.enabled = this.checked;
+            if (!fallback.enabled && getUiSettings().dualApi.primaryIndex === index + 1) {
+                getUiSettings().dualApi.primaryIndex = 0;
+            }
+            renderSettingsTab();
+            updateSaveState();
         } else {
             fallback[field] = this.value;
             if (field === 'endpoint' && event.type === 'change') {
@@ -5364,6 +5417,7 @@ function bindUiEvents() {
             }
         }
         markDirty();
+        updateDualApiExecutionOrder();
     });
     $('#stsc_manager_overlay').on('change', '[data-dual-fallback-model-option]', function () {
         const card = this.closest('[data-fallback-index]');
@@ -5381,6 +5435,7 @@ function bindUiEvents() {
         setSelectedDualApiModels(fallback, selected);
         markDirty();
         $(card).find('.stsc-dual-fallback-selected').html(dualApiSelectedModelsHtml(fallback));
+        updateDualApiExecutionOrder();
     });
     $('#stsc_manager_overlay').on('input', '[data-dual-fallback-model-search]', function () {
         const card = this.closest('[data-fallback-index]');
@@ -5400,14 +5455,26 @@ function bindUiEvents() {
         if (!Number.isInteger(index)) return;
         scheduleDualApiFallbackModelFetch(index, 0, { force: true, showToast: true });
     });
+    $('#stsc_manager_overlay').on('click', '[data-action="set-dual-primary-channel"]', function () {
+        const dual = getUiSettings().dualApi;
+        dual.primaryIndex = clampNumber(this.dataset.channelIndex, 0, Array.isArray(dual.fallbacks) ? dual.fallbacks.length : 0, 0);
+        markDirty();
+        renderSettingsTab();
+        updateSaveState();
+    });
     $('#stsc_manager_overlay').on('click', '[data-action="delete-dual-fallback"]', function () {
         const card = this.closest('[data-fallback-index]');
         const index = Number(card?.dataset?.fallbackIndex);
-        const fallbacks = getUiSettings().dualApi.fallbacks;
+        const dual = getUiSettings().dualApi;
+        const fallbacks = dual.fallbacks;
         if (!Array.isArray(fallbacks) || index < 0 || index >= fallbacks.length) return;
         const removed = fallbacks[index];
         if (removed?.id) dualApiFallbackModelStates.delete(String(removed.id));
         fallbacks.splice(index, 1);
+        const removedChannelIndex = index + 1;
+        if (dual.primaryIndex === removedChannelIndex) dual.primaryIndex = 0;
+        else if (dual.primaryIndex > removedChannelIndex) dual.primaryIndex -= 1;
+        dual.primaryIndex = clampNumber(dual.primaryIndex, 0, fallbacks.length, 0);
         markDirty();
         renderSettingsTab();
         updateSaveState();
@@ -5415,12 +5482,17 @@ function bindUiEvents() {
     $('#stsc_manager_overlay').on('click', '[data-action="move-dual-fallback-up"], [data-action="move-dual-fallback-down"]', function () {
         const card = this.closest('[data-fallback-index]');
         const index = Number(card?.dataset?.fallbackIndex);
-        const fallbacks = getUiSettings().dualApi.fallbacks;
+        const dual = getUiSettings().dualApi;
+        const fallbacks = dual.fallbacks;
         if (!Array.isArray(fallbacks)) return;
         const delta = this.dataset.action === 'move-dual-fallback-up' ? -1 : 1;
         const next = index + delta;
         if (index < 0 || next < 0 || index >= fallbacks.length || next >= fallbacks.length) return;
         [fallbacks[index], fallbacks[next]] = [fallbacks[next], fallbacks[index]];
+        const fromChannel = index + 1;
+        const toChannel = next + 1;
+        if (dual.primaryIndex === fromChannel) dual.primaryIndex = toChannel;
+        else if (dual.primaryIndex === toChannel) dual.primaryIndex = fromChannel;
         markDirty();
         renderSettingsTab();
         updateSaveState();

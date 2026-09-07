@@ -359,6 +359,32 @@ body.stsc-modal-open {
   margin: 8px 0 10px;
 }
 
+.stsc-channel-label-row,
+.stsc-dual-order {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+
+.stsc-channel-label-row {
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.stsc-channel-label-row label {
+  margin: 0;
+}
+
+.stsc-dual-order {
+  margin-top: 9px;
+}
+
+.stsc-primary-channel-pill {
+  border-color: color-mix(in srgb, #74d99f 65%, var(--stsc-border));
+  color: color-mix(in srgb, #74d99f 82%, currentColor);
+}
+
 .stsc-floating-copy-row {
   display: flex;
   justify-content: flex-end;
