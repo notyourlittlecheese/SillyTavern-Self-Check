@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.4';
+const STSC_VERSION = '0.4.5';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -3410,6 +3410,75 @@ function generationModeLabel(mode, detailed = false) {
     return labels[mode] || labels.single;
 }
 
+function formatLatestSelfCheckForCopy(latest) {
+    if (!latest) return '';
+    const lines = [
+        `墨提斯之镜 最新一轮自检`,
+        `状态：${statusText(latest.status)}`,
+        `时间：${new Date(latest.timestamp).toLocaleString()}`,
+        `模式：${generationModeLabel(latest.mode, true)}`,
+    ];
+
+    if (latest.dualApiSource?.label) {
+        lines.push(`自检来源：${latest.dualApiSource.label}`);
+    }
+
+    const answers = Array.isArray(latest.answers) ? latest.answers : [];
+    if (answers.length) {
+        lines.push('');
+        answers.forEach((answer, index) => {
+            const number = index + 1;
+            lines.push(`Q${number}：${String(answer.question || '').trim()}`);
+            lines.push(`A${number}：${String(answer.answer || '（未识别到回答）').trim()}`);
+            if (answer.requireEvidence || answer.evidence) {
+                lines.push(`A${number}依据：${String(answer.evidence || '（未识别到依据）').trim()}`);
+            }
+            if (answer.source) lines.push(`问题来源：${String(answer.source).trim()}`);
+            lines.push('');
+        });
+    } else if (latest.rawCheck) {
+        lines.push('', String(latest.rawCheck).trim());
+    }
+
+    const issues = Array.isArray(latest.formatIssues) ? latest.formatIssues.filter(Boolean) : [];
+    if (issues.length) {
+        lines.push('格式提示：');
+        issues.forEach(issue => lines.push(`- ${plainSelfCheckIssue(issue)}`));
+    }
+
+    return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+async function copyTextToClipboard(text) {
+    const value = String(text || '');
+    if (!value.trim()) throw new Error('没有可复制的内容。');
+    if (globalThis.navigator?.clipboard?.writeText) {
+        await globalThis.navigator.clipboard.writeText(value);
+        return;
+    }
+    const textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', 'readonly');
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    textarea.style.top = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    const copied = document.execCommand('copy');
+    textarea.remove();
+    if (!copied) throw new Error('浏览器拒绝复制，请手动选择内容复制。');
+}
+
+async function copyLatestSelfCheck() {
+    try {
+        const latest = getLatestResult();
+        await copyTextToClipboard(formatLatestSelfCheckForCopy(latest));
+        toastr.success('已复制最新一轮自检内容。', '墨提斯之镜');
+    } catch (error) {
+        toastr.warning(error?.message || '复制失败，请手动复制。', '墨提斯之镜');
+    }
+}
+
 function dualApiSourceMetaHtml(latest) {
     const source = latest?.dualApiSource;
     if (!source?.label) return '';
@@ -3496,6 +3565,7 @@ function renderStatusTab() {
                 <span class="stsc-status-pill">${escapeHtml(generationModeLabel(latest.mode))}</span>
                 <span class="stsc-status-pill">${latest.answeredCount}/${latest.expectedCount} 题</span>
                 <span class="stsc-status-pill">${new Date(latest.timestamp).toLocaleString()}</span>
+                <button class="menu_button stsc-small-button" type="button" data-action="copy-latest-self-check">复制自检</button>
             </div>
             ${dualApiSourceMetaHtml(latest)}
             ${issues}
@@ -4282,7 +4352,7 @@ function renderFloatingCheckPage() {
     const answers = (latest.answers || []).length
         ? latest.answers.map((answer, index) => renderAnswerCard(answer, index)).join('')
         : `<div class="stsc-test-result">${escapeHtml(latest.rawCheck || '没有可显示的自检内容。')}</div>`;
-    $('#stsc_floating_content').html(`${dualApiSourceMetaHtml(latest)}${issues}${answers}`);
+    $('#stsc_floating_content').html(`<div class="stsc-floating-copy-row"><button class="menu_button stsc-small-button" type="button" data-action="copy-latest-self-check">复制自检</button></div>${dualApiSourceMetaHtml(latest)}${issues}${answers}`);
 }
 
 function renderFloatingReviewPage() {
@@ -5030,6 +5100,10 @@ function bindUiEvents() {
         floatingPanelPage = nextPage;
         renderFloating();
         if (floatingPanelPage === 'check' && !$('#stsc_floating_panel').hasClass('stsc-hidden')) void markLatestIssueViewed();
+    });
+    $(document).on('click', '[data-action="copy-latest-self-check"]', function (event) {
+        event.preventDefault();
+        void copyLatestSelfCheck();
     });
     $('#stsc_floating_panel').on('change', '[data-floating-instruction-mode]', function () {
         const id = $(this).closest('[data-floating-temp-id]').data('floating-temp-id');

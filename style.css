@@ -359,6 +359,12 @@ body.stsc-modal-open {
   margin: 8px 0 10px;
 }
 
+.stsc-floating-copy-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 8px;
+}
+
 .stsc-status-ok { color: #83d89e; }
 .stsc-status-warning { color: #efbd68; }
 .stsc-status-error { color: #ff8585; }
