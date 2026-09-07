@@ -351,6 +351,14 @@ body.stsc-modal-open {
   overflow-wrap: anywhere;
 }
 
+.stsc-source-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  margin: 8px 0 10px;
+}
+
 .stsc-status-ok { color: #83d89e; }
 .stsc-status-warning { color: #efbd68; }
 .stsc-status-error { color: #ff8585; }
@@ -2362,8 +2370,47 @@ body.stsc-modal-open {
     white-space: nowrap;
 }
 
-.stsc-model-multi {
+.stsc-model-choice-list {
     min-height: 7.5em;
+    max-height: 13.5em;
+    overflow: auto;
+    padding: 7px;
+    border: 1px solid var(--SmartThemeBorderColor, var(--stsc-border));
+    border-radius: 8px;
+    background: var(--SmartThemeBlurTintColor, var(--stsc-panel));
+}
+
+.stsc-model-choice-list.is-disabled {
+    opacity: 0.62;
+    pointer-events: none;
+}
+
+.stsc-model-choice {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    width: 100%;
+    min-height: 32px;
+    margin: 0;
+    padding: 6px 7px;
+    border-radius: 6px;
+    line-height: 1.35;
+    cursor: pointer;
+}
+
+.stsc-model-choice:hover {
+    background: color-mix(in srgb, currentColor 8%, transparent);
+}
+
+.stsc-model-choice span {
+    overflow-wrap: anywhere;
+}
+
+.stsc-model-list-empty {
+    min-height: calc(7.5em - 14px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
 }
 
 .stsc-model-status {

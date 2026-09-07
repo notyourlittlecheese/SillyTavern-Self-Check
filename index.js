@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.2';
+const STSC_VERSION = '0.4.3';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -269,6 +269,9 @@ function addGenerationResultLog(latest, visibleBody = '') {
     const formatDetails = (latest.formatIssues || []).map(plainSelfCheckIssue).filter(Boolean);
     const repairedReasoningBoundary = (latest.recoveryNotes || []).some(note => /正文.*思维链|推理标签.*正文/.test(String(note)));
     const handlingParts = [`本轮使用${mode}模式。`];
+    if (latest.dualApiSource?.label) {
+        handlingParts.push(`自检结果由${latest.dualApiSource.label}输出。`);
+    }
     let level = 'info';
     let message = '';
 
@@ -962,32 +965,40 @@ function extractDualApiModelIds(payload) {
     return [...new Set(ids)].sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
 }
 
-function dualApiModelOptionsHtml(dual) {
-    const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
-    const savedModels = selectedDualApiModels(dual);
+function dualApiModelChoicesHtml(config, models, state, optionAttr) {
+    const endpoint = normalizeDualApiBaseUrl(config.endpoint);
+    const savedModels = selectedDualApiModels(config);
+    const availableModels = Array.isArray(models) ? models : [];
+    const loading = Boolean(state?.loading);
+    const error = String(state?.error || '');
 
-    if (dualApiModelsLoading) {
-        return '<option value="">正在获取模型列表……</option>';
+    if (loading) {
+        return '<div class="stsc-empty stsc-model-list-empty">正在获取模型列表……</div>';
     }
 
-    if (dualApiModels.length) {
-        return dualApiModels.map(model => `<option value="${escapeHtml(model)}" ${savedModels.includes(model) ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+    const choices = availableModels.length ? availableModels : savedModels;
+    if (choices.length) {
+        return choices.map(model => `
+            <label class="checkbox_label stsc-model-choice">
+                <input type="checkbox" ${optionAttr} value="${escapeHtml(model)}" ${savedModels.includes(model) ? 'checked' : ''}>
+                <span>${escapeHtml(model)}${availableModels.length ? '' : '（等待刷新）'}</span>
+            </label>
+        `).join('');
     }
 
     if (!endpoint) {
-        return '<option value="">请先填写自检API地址</option>';
+        return '<div class="stsc-empty stsc-model-list-empty">请先填写接口地址</div>';
     }
 
-    if (dualApiModelsError) {
-        const saved = savedModels.map(model => `<option value="${escapeHtml(model)}" selected>${escapeHtml(model)}（上次选择）</option>`).join('');
-        return `${saved}<option value="" ${saved ? '' : 'selected'}>模型获取失败，请检查接口</option>`;
+    if (error) {
+        return '<div class="stsc-empty stsc-model-list-empty">模型获取失败，请检查接口</div>';
     }
 
-    if (savedModels.length) {
-        return savedModels.map(model => `<option value="${escapeHtml(model)}" selected>${escapeHtml(model)}（等待刷新）</option>`).join('');
-    }
+    return '<div class="stsc-empty stsc-model-list-empty">模型将自动获取</div>';
+}
 
-    return '<option value="">模型将自动获取</option>';
+function dualApiModelOptionsHtml(dual) {
+    return dualApiModelChoicesHtml(dual, dualApiModels, { loading: dualApiModelsLoading, error: dualApiModelsError }, 'data-dual-model-option="primary"');
 }
 
 function dualApiModelStatusText(dual) {
@@ -995,7 +1006,7 @@ function dualApiModelStatusText(dual) {
     if (!endpoint) return '填写接口地址后，插件会自动读取该接口提供的模型列表。';
     if (dualApiModelsLoading) return '正在连接接口并读取模型列表……';
     if (dualApiModelsError) return dualApiModelsError;
-    if (dualApiModels.length) return `已获取 ${dualApiModels.length} 个可用模型，可按住 Ctrl/Command 多选。`;
+    if (dualApiModels.length) return `已获取 ${dualApiModels.length} 个可用模型，可直接点选多个；同一接口会按列表顺序依次尝试。`;
     return '等待自动获取模型列表。';
 }
 
@@ -1009,23 +1020,8 @@ function fallbackModelState(item) {
 }
 
 function dualApiFallbackModelOptionsHtml(item) {
-    const endpoint = normalizeDualApiBaseUrl(item.endpoint);
-    const savedModels = selectedDualApiModels(item);
     const state = fallbackModelState(item);
-
-    if (state.loading) return '<option value="">正在获取模型列表……</option>';
-    if (state.models.length) {
-        return state.models.map(model => `<option value="${escapeHtml(model)}" ${savedModels.includes(model) ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
-    }
-    if (!endpoint) return '<option value="">请先填写接口地址</option>';
-    if (state.error) {
-        const saved = savedModels.map(model => `<option value="${escapeHtml(model)}" selected>${escapeHtml(model)}（上次选择）</option>`).join('');
-        return `${saved}<option value="" ${saved ? '' : 'selected'}>模型获取失败，请检查接口</option>`;
-    }
-    if (savedModels.length) {
-        return savedModels.map(model => `<option value="${escapeHtml(model)}" selected>${escapeHtml(model)}（等待刷新）</option>`).join('');
-    }
-    return '<option value="">模型将自动获取</option>';
+    return dualApiModelChoicesHtml(item, state.models, state, 'data-dual-fallback-model-option');
 }
 
 function dualApiFallbackModelStatusText(item) {
@@ -1034,7 +1030,7 @@ function dualApiFallbackModelStatusText(item) {
     if (!endpoint) return '填写接口地址后可刷新模型列表。';
     if (state.loading) return '正在读取备用API模型列表……';
     if (state.error) return state.error;
-    if (state.models.length) return `已获取 ${state.models.length} 个可用模型，可按住 Ctrl/Command 多选。`;
+    if (state.models.length) return `已获取 ${state.models.length} 个可用模型，可直接点选多个。`;
     return '等待刷新模型列表。';
 }
 
@@ -1062,9 +1058,9 @@ function dualApiFallbacksHtml(dual) {
                 <div class="stsc-field">
                     <label>模型</label>
                     <div class="stsc-model-row">
-                        <select class="text_pole stsc-model-multi" multiple size="4" data-dual-fallback-field="models" ${normalizeDualApiBaseUrl(item.endpoint) ? '' : 'disabled'}>
+                        <div class="stsc-model-choice-list ${normalizeDualApiBaseUrl(item.endpoint) && !fallbackModelState(item).loading ? '' : 'is-disabled'}" data-dual-fallback-field="models">
                             ${dualApiFallbackModelOptionsHtml(item)}
-                        </select>
+                        </div>
                         <button class="menu_button stsc-small-button" type="button" data-action="refresh-dual-fallback-models" ${normalizeDualApiBaseUrl(item.endpoint) ? '' : 'disabled'}>${fallbackModelState(item).loading ? '获取中…' : '刷新模型'}</button>
                     </div>
                     <div class="stsc-muted stsc-model-status ${fallbackModelState(item).error ? 'stsc-model-status-error' : ''} ${fallbackModelState(item).models.length && !fallbackModelState(item).error ? 'stsc-model-status-success' : ''}">${escapeHtml(dualApiFallbackModelStatusText(item))}</div>
@@ -1083,14 +1079,14 @@ function updateDualApiModelControl() {
     const dual = settings?.dualApi;
     if (!dual) return;
 
-    const select = document.getElementById('stsc_dual_model');
+    const list = document.getElementById('stsc_dual_model');
     const button = document.getElementById('stsc_refresh_models');
     const status = document.getElementById('stsc_dual_model_status');
-    if (!select) return;
+    if (!list) return;
 
-    select.innerHTML = dualApiModelOptionsHtml(dual);
+    list.innerHTML = dualApiModelOptionsHtml(dual);
     const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
-    select.disabled = !endpoint || dualApiModelsLoading;
+    list.classList.toggle('is-disabled', !endpoint || dualApiModelsLoading);
 
     if (dualApiModels.length) {
         const savedModels = selectedDualApiModels(dual).filter(model => dualApiModels.includes(model));
@@ -1099,8 +1095,8 @@ function updateDualApiModelControl() {
             setSelectedDualApiModels(dual, selected);
             markDirty();
         }
-        Array.from(select.options).forEach(option => {
-            option.selected = selected.includes(option.value);
+        list.querySelectorAll('[data-dual-model-option]').forEach(option => {
+            option.checked = selected.includes(option.value);
         });
     }
 
@@ -2406,9 +2402,11 @@ function getDualApiCandidates(dual) {
         const endpoint = normalizeDualApiBaseUrl(config.endpoint);
         const apiKey = String(config.apiKey || '');
         if (!endpoint) return;
-        selectedDualApiModels(config).forEach((model, modelIndex) => {
+        const models = selectedDualApiModels(config);
+        models.forEach((model, modelIndex) => {
             candidates.push({
-                label: selectedDualApiModels(config).length > 1 ? `${config.label} / ${model}` : config.label,
+                label: `${config.label} / ${model}`,
+                apiName: config.label,
                 endpoint,
                 apiKey,
                 model,
@@ -2488,7 +2486,14 @@ async function callDualApiCandidate(
                 error.transient = true;
                 throw error;
             }
-            return { text, attempts: attempt + 1, compact: attemptCompact, apiLabel: candidate.label };
+            return {
+                text,
+                attempts: attempt + 1,
+                compact: attemptCompact,
+                apiLabel: candidate.label,
+                apiName: candidate.apiName || candidate.label,
+                model,
+            };
         } catch (caught) {
             let error = caught instanceof Error ? caught : new Error(String(caught || '未知错误'));
             if (error.name === 'AbortError') {
@@ -2996,12 +3001,23 @@ function refreshMessageDom(messageId, message) {
     }
 }
 
-function makeLatestResult({ parsed, questions, mode, messageId, rawOverride = '', statusOverride = '' }) {
+function makeLatestResult({ parsed, questions, mode, messageId, rawOverride = '', statusOverride = '', dualApiResult = null }) {
     const entity = getCurrentEntity();
     const boundPreset = getBoundPreset();
     const settings = normalizeSettings();
 
     const status = statusOverride || parsed.status;
+    const dualApiSource = mode === 'dual_api' && dualApiResult
+        ? {
+            label: String(dualApiResult.apiLabel || '').trim(),
+            apiName: String(dualApiResult.apiName || '').trim(),
+            model: String(dualApiResult.model || '').trim(),
+            attempts: Math.max(1, Number(dualApiResult.attempts) || 1),
+            compact: Boolean(dualApiResult.compact),
+            failedApis: Array.isArray(dualApiResult.failedApis) ? dualApiResult.failedApis : [],
+        }
+        : null;
+
     return {
         version: STSC_VERSION,
         timestamp: Date.now(),
@@ -3020,6 +3036,7 @@ function makeLatestResult({ parsed, questions, mode, messageId, rawOverride = ''
         answeredCount: (parsed.answers || []).filter(x => x.answer?.trim()).length,
         generalPresetName: settings.generalEnabled ? getPresetById(settings.generalPresetId)?.name || '' : '',
         characterPresetName: settings.characterEnabled ? boundPreset?.name || '' : '',
+        dualApiSource,
     };
 }
 
@@ -3091,6 +3108,7 @@ async function handleMessageReceived(data) {
             messageId,
             rawOverride: checkParsed.rawCheck || run.dualCheck,
             statusOverride: dualStatus,
+            dualApiResult: run.dualApiResult,
         });
         latest.previousReview = run.previousReview || null;
         const mainReasoningWrapper = visibleResponseReasoningWrapper(body);
@@ -3191,6 +3209,7 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
         generationType: type,
         dualCheck: '',
         dualParsed: null,
+        dualApiResult: null,
         previousReview: null,
         targetMessageFloor,
     };
@@ -3214,6 +3233,7 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
                 temporaryInstructions,
                 settings,
             });
+            let dualApiResult = initialResponse;
             let rawCheck = initialResponse.text;
             let dualParsed = parseModelOutput(rawCheck, dualQuestions);
             let previousReview = parsePreviousReview(rawCheck);
@@ -3236,6 +3256,7 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
                     const retrySelfCheckComplete = dualParsedIsComplete(retryParsed, dualQuestions);
                     if (retrySelfCheckComplete && (!initialSelfCheckComplete || retryReview)) {
                         rawCheck = retryRawCheck;
+                        dualApiResult = retryResponse;
                         dualParsed = retryParsed;
                         previousReview = retryReview || previousReview;
                         dualParsed.repaired = true;
@@ -3281,6 +3302,7 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
             }
             pendingRun.dualCheck = rawCheck;
             pendingRun.dualParsed = dualParsed;
+            pendingRun.dualApiResult = dualApiResult;
             pendingRun.previousReview = previousReview;
             pendingRun.mode = 'dual_api';
             applyDualApiMainPrompt(dualQuestions, dualParsed, rawCheck, settings);
@@ -3343,6 +3365,21 @@ function generationModeLabel(mode, detailed = false) {
         strict: detailed ? '旧双阶段模式（已移除）' : '旧双阶段模式',
     };
     return labels[mode] || labels.single;
+}
+
+function dualApiSourceMetaHtml(latest) {
+    const source = latest?.dualApiSource;
+    if (!source?.label) return '';
+    const details = [];
+    if (source.attempts > 1) details.push(`重试 ${source.attempts - 1} 次`);
+    if (source.compact) details.push('精简上下文');
+    if (source.failedApis?.length) details.push(`前置失败 ${source.failedApis.length} 个`);
+    return `
+        <div class="stsc-source-meta">
+            <span class="stsc-source-pill">自检来源：${escapeHtml(source.label)}</span>
+            ${details.length ? `<span class="stsc-muted">${escapeHtml(details.join('｜'))}</span>` : ''}
+        </div>
+    `;
 }
 
 function renderCompact() {
@@ -3417,6 +3454,7 @@ function renderStatusTab() {
                 <span class="stsc-status-pill">${latest.answeredCount}/${latest.expectedCount} 题</span>
                 <span class="stsc-status-pill">${new Date(latest.timestamp).toLocaleString()}</span>
             </div>
+            ${dualApiSourceMetaHtml(latest)}
             ${issues}
             ${answers}
         `;
@@ -3845,13 +3883,13 @@ function renderSettingsTab() {
                 <div class="stsc-field">
                     <label>自检模型</label>
                     <div class="stsc-model-row">
-                        <select id="stsc_dual_model" class="text_pole stsc-model-multi" multiple size="5" ${normalizeDualApiBaseUrl(dual.endpoint) && !dualApiModelsLoading ? '' : 'disabled'}>
+                        <div id="stsc_dual_model" class="stsc-model-choice-list ${normalizeDualApiBaseUrl(dual.endpoint) && !dualApiModelsLoading ? '' : 'is-disabled'}">
                             ${modelOptions}
-                        </select>
+                        </div>
                         <button id="stsc_refresh_models" class="menu_button stsc-small-button" type="button" ${normalizeDualApiBaseUrl(dual.endpoint) && !dualApiModelsLoading ? '' : 'disabled'}>${dualApiModelsLoading ? '获取中…' : '刷新模型'}</button>
                     </div>
                     <div id="stsc_dual_model_status" class="stsc-muted stsc-model-status ${dualApiModelsError ? 'stsc-model-status-error' : ''} ${dualApiModels.length && !dualApiModelsError ? 'stsc-model-status-success' : ''}">${escapeHtml(dualApiModelStatusText(dual))}</div>
-                    <div class="stsc-muted">模型列表会根据接口自动拉取；可按住 Ctrl/Command 多选，同一接口会按选中顺序依次尝试模型。</div>
+                    <div class="stsc-muted">模型列表会根据接口自动拉取；手机和电脑都可直接点选多个，同一接口会按列表顺序依次尝试模型。</div>
                 </div>
             </div>
 
@@ -4199,7 +4237,7 @@ function renderFloatingCheckPage() {
     const answers = (latest.answers || []).length
         ? latest.answers.map((answer, index) => renderAnswerCard(answer, index)).join('')
         : `<div class="stsc-test-result">${escapeHtml(latest.rawCheck || '没有可显示的自检内容。')}</div>`;
-    $('#stsc_floating_content').html(`${issues}${answers}`);
+    $('#stsc_floating_content').html(`${dualApiSourceMetaHtml(latest)}${issues}${answers}`);
 }
 
 function renderFloatingReviewPage() {
@@ -5145,9 +5183,14 @@ function bindUiEvents() {
         resetDualApiModelState();
         if (normalizeDualApiBaseUrl(dual.endpoint)) scheduleDualApiModelFetch(event.type === 'change' ? 0 : 800);
     });
-    $('#stsc_manager_overlay').on('change', '#stsc_dual_model', function () {
-        const selected = Array.from(this.selectedOptions).map(option => option.value).filter(value => dualApiModels.includes(value));
-        if (!selected.length) return;
+    $('#stsc_manager_overlay').on('change', '[data-dual-model-option="primary"]', function () {
+        const selected = Array.from(document.querySelectorAll('[data-dual-model-option="primary"]:checked'))
+            .map(option => option.value)
+            .filter(value => !dualApiModels.length || dualApiModels.includes(value));
+        if (!selected.length) {
+            this.checked = true;
+            return;
+        }
         setSelectedDualApiModels(getUiSettings().dualApi, selected);
         markDirty();
     });
@@ -5174,15 +5217,10 @@ function bindUiEvents() {
         const index = Number(card?.dataset?.fallbackIndex);
         const field = String(this.dataset.dualFallbackField || '');
         const fallback = getUiSettings().dualApi.fallbacks?.[index];
-        if (!fallback || !['endpoint', 'model', 'apiKey', 'enabled'].includes(field)) return;
+        if (!fallback || !['endpoint', 'apiKey', 'enabled'].includes(field)) return;
 
         if (field === 'enabled') {
             fallback.enabled = this.checked;
-        } else if (field === 'models') {
-            const state = fallbackModelState(fallback);
-            const selected = Array.from(this.selectedOptions).map(option => option.value).filter(value => !state.models.length || state.models.includes(value));
-            if (!selected.length) return;
-            setSelectedDualApiModels(fallback, selected);
         } else {
             fallback[field] = this.value;
             if (field === 'endpoint' && event.type === 'change') {
@@ -5202,6 +5240,22 @@ function bindUiEvents() {
                 }
             }
         }
+        markDirty();
+    });
+    $('#stsc_manager_overlay').on('change', '[data-dual-fallback-model-option]', function () {
+        const card = this.closest('[data-fallback-index]');
+        const index = Number(card?.dataset?.fallbackIndex);
+        const fallback = getUiSettings().dualApi.fallbacks?.[index];
+        if (!fallback) return;
+        const state = fallbackModelState(fallback);
+        const selected = Array.from(card.querySelectorAll('[data-dual-fallback-model-option]:checked'))
+            .map(option => option.value)
+            .filter(value => !state.models.length || state.models.includes(value));
+        if (!selected.length) {
+            this.checked = true;
+            return;
+        }
+        setSelectedDualApiModels(fallback, selected);
         markDirty();
     });
     $('#stsc_manager_overlay').on('click', '[data-action="add-dual-fallback"]', function () {
