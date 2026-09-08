@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.10';
+const STSC_VERSION = '0.4.11';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -2877,6 +2877,27 @@ function parseItems(checkInner) {
     return items;
 }
 
+function parseLooseAnswerItems(text) {
+    const source = String(text ?? '');
+    const items = [];
+    const answerRegex = /<answer\b([^>]*)>([\s\S]*?)<\/answer>/gi;
+    const matches = [...source.matchAll(answerRegex)];
+    matches.forEach((match, offset) => {
+        const attributes = match[1];
+        const id = readItemAttribute(attributes, 'id');
+        const index = Number.parseInt(readItemAttribute(attributes, 'index'), 10) || 0;
+        if (!id && !index) return;
+        const answer = decodeXmlEntities(match[2] ?? '').trim();
+        const afterAnswerStart = Number(match.index || 0) + match[0].length;
+        const afterAnswerEnd = offset + 1 < matches.length ? Number(matches[offset + 1].index || source.length) : source.length;
+        const tail = source.slice(afterAnswerStart, afterAnswerEnd);
+        const evidenceMatch = tail.match(/<evidence\b[^>]*>([\s\S]*?)<\/evidence>/i);
+        const evidence = decodeXmlEntities(evidenceMatch?.[1] ?? '').trim();
+        items.push({ id, index, answer, evidence });
+    });
+    return items;
+}
+
 function unwrapResponse(text) {
     // 兼容极早期版本的 <stsc_response> 标签，但绝不删除标签之前的内容。
     const source = String(text ?? '');
@@ -3006,30 +3027,45 @@ function parseModelOutput(text, expectedQuestions = []) {
     };
 
     if (!openMatch) {
-        result.formatIssues.push('完全没有输出 <stsc_self_check>。');
-        return result;
-    }
-
-    const innerStart = openMatch.index + openMatch[0].length;
-    const hasUsableClose = Boolean(closeMatch && closeMatch.index >= openMatch.index);
-    const innerEnd = hasUsableClose ? closeMatch.index : source.length;
-    const inner = source.slice(innerStart, innerEnd).trim();
-    if (!hasUsableClose) {
+        result.items = parseLooseAnswerItems(source);
+        if (!result.items.length) {
+            result.formatIssues.push('完全没有输出 <stsc_self_check>。');
+            return result;
+        }
         result.repaired = true;
-        result.recoveryNotes.push('自检结束标签缺失，插件已按返回文本末尾自动补全并继续解析。');
+        result.rawCheck = source;
+        result.body = '';
+        result.recoveryNotes.push('AI没有输出外层 <stsc_self_check>，但插件已按 <answer id="q1"> 这类题号标签恢复自检问答。');
+    } else {
+        const innerStart = openMatch.index + openMatch[0].length;
+        const hasUsableClose = Boolean(closeMatch && closeMatch.index >= openMatch.index);
+        const innerEnd = hasUsableClose ? closeMatch.index : source.length;
+        const inner = source.slice(innerStart, innerEnd).trim();
+        if (!hasUsableClose) {
+            result.repaired = true;
+            result.recoveryNotes.push('自检结束标签缺失，插件已按返回文本末尾自动补全并继续解析。');
+        }
+        if (normalized.decodedOuterXml) {
+            result.repaired = true;
+            result.recoveryNotes.push('自检XML被转义，插件已自动还原后解析。');
+        }
+        if (reasoningBoundaryRepair.repairedTags.length) {
+            result.repaired = true;
+            result.recoveryNotes.push('AI把正文错误包在思维链标签内，插件已在自检开始前闭合推理区，并把正文保留在思维链外。');
+        }
+        result.rawCheck = inner;
+        result.items = parseItems(inner);
+        if (!result.items.length) {
+            const looseItems = parseLooseAnswerItems(inner);
+            if (looseItems.length) {
+                result.items = looseItems;
+                result.repaired = true;
+                result.recoveryNotes.push('AI没有输出 <item> 包裹，插件已按 <answer id="q1"> 这类题号标签恢复自检问答。');
+            }
+        }
+        // 仅精准移除 <stsc_self_check>…</stsc_self_check>，保留它之前的原生 thinking / reasoning 与之后的正文。
+        result.body = extractVisibleBody(source);
     }
-    if (normalized.decodedOuterXml) {
-        result.repaired = true;
-        result.recoveryNotes.push('自检XML被转义，插件已自动还原后解析。');
-    }
-    if (reasoningBoundaryRepair.repairedTags.length) {
-        result.repaired = true;
-        result.recoveryNotes.push('AI把正文错误包在思维链标签内，插件已在自检开始前闭合推理区，并把正文保留在思维链外。');
-    }
-    result.rawCheck = inner;
-    result.items = parseItems(inner);
-    // 仅精准移除 <stsc_self_check>…</stsc_self_check>，保留它之前的原生 thinking / reasoning 与之后的正文。
-    result.body = extractVisibleBody(source);
 
     const usedItems = new Set();
     let usedOrderFallback = false;
