@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.9';
+const STSC_VERSION = '0.4.10';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -5192,20 +5192,26 @@ async function testDualApiSelfCheckOnly() {
         const parsed = parseModelOutput(result.text, questions);
         const status = dualParsedIsComplete(parsed, questions) ? 'ok' : parsed.status;
         const issues = (parsed.formatIssues || []).map(plainSelfCheckIssue).filter(Boolean);
+        const rawReturn = String(result.text || '').trim();
         const answers = (parsed.answers || []).map((answer, index) => [
             `Q${index + 1}：${answer.question || ''}`,
             `A${index + 1}：${answer.answer || '（未识别到回答）'}`,
             answer.requireEvidence || answer.evidence ? `依据：${answer.evidence || '（未识别到依据）'}` : '',
         ].filter(Boolean).join('\n')).join('\n\n');
         lastTestResult = [
-            '双API自检测试完成（未生成正文）',
+            status === 'ok' ? '双API自检测试完成（未生成正文）' : '双API接口已返回，但自检格式未完整识别（未生成正文）',
             `来源：${result.apiLabel || '未识别渠道'}`,
             `状态：${statusText(status)}｜${(parsed.answers || []).filter(answer => answer.answer?.trim()).length}/${questions.length} 题`,
             result.failedApis?.length ? `前置失败：${result.failedApis.map(item => `${item.label}：${item.message}`).join('；')}` : '',
             issues.length ? `格式提示：${issues.join('；')}` : '',
-            answers || result.text || '测试没有返回内容。',
+            answers ? `解析出的自检问答：\n${answers}` : '',
+            rawReturn ? `原始返回：\n${rawReturn}` : '测试没有返回内容。',
         ].filter(Boolean).join('\n\n');
-        toastr.success(`双API自检测试完成：${result.apiLabel || '已返回结果'}`, '墨提斯之镜');
+        if (status === 'ok') {
+            toastr.success(`双API自检测试完成：${result.apiLabel || '已返回结果'}`, '墨提斯之镜');
+        } else {
+            toastr.warning(`双API接口已返回，但没有完整识别自检格式：${result.apiLabel || '已返回结果'}`, '墨提斯之镜');
+        }
         renderAll();
     } catch (error) {
         console.error('[STSC] 双API自检测试失败：', error);
