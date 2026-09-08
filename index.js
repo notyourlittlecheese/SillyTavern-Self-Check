@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.8';
+const STSC_VERSION = '0.4.9';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -2665,7 +2665,7 @@ async function callDualApiSelfCheck(
                 message: error.message || '未知错误',
             });
             if (index + 1 < candidates.length) {
-                Logger.warn(`[STSC] ${candidate.label}失败，准备尝试下一个自检API：`, error);
+                console.warn(`[STSC] ${candidate.label}失败，准备尝试下一个自检API：`, error);
             }
         }
     }
