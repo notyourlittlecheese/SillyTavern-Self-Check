@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.7';
+const STSC_VERSION = '0.4.8';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -3549,6 +3549,15 @@ async function copyLatestSelfCheck() {
     }
 }
 
+async function copyLastTestResult() {
+    try {
+        await copyTextToClipboard(lastTestResult);
+        toastr.success('已复制最近一次测试结果。', '墨提斯之镜');
+    } catch (error) {
+        toastr.warning(error?.message || '复制失败，请手动复制。', '墨提斯之镜');
+    }
+}
+
 function dualApiSourceMetaHtml(latest) {
     const source = latest?.dualApiSource;
     if (!source?.label) return '';
@@ -3609,6 +3618,19 @@ function renderAnswerCard(answer, index) {
             ${evidenceHtml}
             ${sourceHtml}
         </div>`;
+}
+
+function testResultSectionHtml() {
+    return lastTestResult
+        ? `
+        <div class="stsc-section">
+            <div class="stsc-section-title stsc-section-title-row">
+                <span>最近一次测试结果</span>
+                <button class="menu_button stsc-small-button" type="button" data-action="copy-last-test-result">复制测试结果</button>
+            </div>
+            <div class="stsc-test-result">${escapeHtml(lastTestResult)}</div>
+        </div>`
+        : '';
 }
 
 function renderStatusTab() {
@@ -3823,11 +3845,7 @@ function renderPresetsTab() {
             <div id="stsc_question_list">${questionsHtml}</div>
         </div>` : ''}
 
-        ${lastTestResult ? `
-        <div class="stsc-section">
-            <div class="stsc-section-title">最近一次测试结果</div>
-            <div class="stsc-test-result">${escapeHtml(lastTestResult)}</div>
-        </div>` : ''}
+        ${testResultSectionHtml()}
     `);
 }
 
@@ -4177,7 +4195,13 @@ function renderSettingsTab() {
                     <span>资料库自动问题会改成“自包含规则型问题”，要求自检API说清楚正文具体该怎么写、怎么遵照；酒馆主API即使没有直接读取资料原文，也能看懂答案。</span>
                 </div>
             </div>
+            <div class="stsc-toolbar" style="margin-top:12px">
+                <button class="menu_button" type="button" data-action="test-dual-api-self-check">测试双API自检（不生成正文）</button>
+                <span class="stsc-muted">按当前渠道与模型顺序发起一次独立自检，不调用酒馆主API写正文。</span>
+            </div>
         </div>
+
+        ${testResultSectionHtml()}
 
         <div class="stsc-section">
             <div class="stsc-section-title">自检与快捷指令默认注入位置</div>
@@ -5137,6 +5161,64 @@ ${questionText}
     }
 }
 
+async function testDualApiSelfCheckOnly() {
+    if (testBusy) return;
+    const context = ctx();
+    const settings = clone(getUiSettings());
+    const questions = getDualApiQuestions(settings);
+    const references = getActiveReferences(settings);
+    const temporaryInstructions = getSelectedTemporaryInstructions({ consume: false, settings });
+    if (!questions.length) {
+        toastr.warning('当前没有生效的问题可以测试。', '墨提斯之镜');
+        return;
+    }
+
+    testBusy = true;
+    const loader = context.loader?.show?.({
+        message: '正在测试双API自检…',
+        title: '墨提斯之镜',
+        toastMode: 'stoppable',
+    });
+
+    try {
+        clearRuntimePrompts();
+        const result = await callDualApiSelfCheck({
+            chat: context.chat || [],
+            questions,
+            references,
+            temporaryInstructions,
+            settings,
+        }, { allowTransientRetry: true });
+        const parsed = parseModelOutput(result.text, questions);
+        const status = dualParsedIsComplete(parsed, questions) ? 'ok' : parsed.status;
+        const issues = (parsed.formatIssues || []).map(plainSelfCheckIssue).filter(Boolean);
+        const answers = (parsed.answers || []).map((answer, index) => [
+            `Q${index + 1}：${answer.question || ''}`,
+            `A${index + 1}：${answer.answer || '（未识别到回答）'}`,
+            answer.requireEvidence || answer.evidence ? `依据：${answer.evidence || '（未识别到依据）'}` : '',
+        ].filter(Boolean).join('\n')).join('\n\n');
+        lastTestResult = [
+            '双API自检测试完成（未生成正文）',
+            `来源：${result.apiLabel || '未识别渠道'}`,
+            `状态：${statusText(status)}｜${(parsed.answers || []).filter(answer => answer.answer?.trim()).length}/${questions.length} 题`,
+            result.failedApis?.length ? `前置失败：${result.failedApis.map(item => `${item.label}：${item.message}`).join('；')}` : '',
+            issues.length ? `格式提示：${issues.join('；')}` : '',
+            answers || result.text || '测试没有返回内容。',
+        ].filter(Boolean).join('\n\n');
+        toastr.success(`双API自检测试完成：${result.apiLabel || '已返回结果'}`, '墨提斯之镜');
+        renderAll();
+    } catch (error) {
+        console.error('[STSC] 双API自检测试失败：', error);
+        lastTestResult = `双API自检测试失败：${dualApiFailureMessage(error)}`;
+        toastr.error('双API自检测试失败，请检查渠道、模型和密钥。', '墨提斯之镜');
+        renderAll();
+    } finally {
+        clearRuntimePrompts();
+        testBusy = false;
+        await loader?.hide?.();
+    }
+}
+
 function bindUiEvents() {
     $('#stsc_close_manager').on('click', closeManager);
     $('#stsc_version_button').on('click', openVersionDialog);
@@ -5178,6 +5260,10 @@ function bindUiEvents() {
     $(document).on('click', '[data-action="copy-latest-self-check"]', function (event) {
         event.preventDefault();
         void copyLatestSelfCheck();
+    });
+    $(document).on('click', '[data-action="copy-last-test-result"]', function (event) {
+        event.preventDefault();
+        void copyLastTestResult();
     });
     $('#stsc_floating_panel').on('change', '[data-floating-instruction-mode]', function () {
         const id = $(this).closest('[data-floating-temp-id]').data('floating-temp-id');
@@ -5788,6 +5874,9 @@ function bindUiEvents() {
             preset.boundCharacterName = '';
         } else if (action === 'test-preset') {
             await testCurrentPreset();
+            return;
+        } else if (action === 'test-dual-api-self-check') {
+            await testDualApiSelfCheckOnly();
             return;
         } else if (action === 'add-question' && preset) {
             const question = createQuestion();
