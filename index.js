@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.6';
+const STSC_VERSION = '0.4.7';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -948,6 +948,26 @@ function setSelectedDualApiModels(config, models) {
     config.model = selected[0] || '';
 }
 
+function updateSelectedDualApiModel(config, model, checked) {
+    const value = String(model || '').trim();
+    if (!value) return selectedDualApiModels(config);
+    const selected = selectedDualApiModels(config).filter(item => item !== value);
+    if (checked) selected.push(value);
+    else if (!selected.length) return selectedDualApiModels(config);
+    setSelectedDualApiModels(config, selected);
+    return selectedDualApiModels(config);
+}
+
+function moveSelectedDualApiModel(config, model, delta) {
+    const selected = selectedDualApiModels(config);
+    const index = selected.indexOf(String(model || '').trim());
+    const next = index + delta;
+    if (index < 0 || next < 0 || next >= selected.length) return false;
+    [selected[index], selected[next]] = [selected[next], selected[index]];
+    setSelectedDualApiModels(config, selected);
+    return true;
+}
+
 function extractDualApiModelIds(payload) {
     const candidates = [
         payload?.data,
@@ -1005,7 +1025,13 @@ function dualApiSelectedModelsHtml(config) {
     return `
         <div class="stsc-selected-models">
             <span class="stsc-muted">已选：</span>
-            ${models.map(model => `<span class="stsc-model-pill">${escapeHtml(model)}</span>`).join('')}
+            ${models.map((model, index) => `
+                <span class="stsc-model-pill">
+                    <span>${index + 1}. ${escapeHtml(model)}</span>
+                    <button class="stsc-model-order-button" type="button" data-action="move-selected-model" data-model="${escapeHtml(model)}" data-direction="-1" title="上移" aria-label="上移" ${index === 0 ? 'disabled' : ''}>↑</button>
+                    <button class="stsc-model-order-button" type="button" data-action="move-selected-model" data-model="${escapeHtml(model)}" data-direction="1" title="下移" aria-label="下移" ${index === models.length - 1 ? 'disabled' : ''}>↓</button>
+                </span>
+            `).join('')}
         </div>
     `;
 }
@@ -1020,7 +1046,10 @@ function dualApiExecutionOrderHtml(dual) {
     const channels = orderedDualApiChannelConfigs(dual);
     const parts = channels
         .filter(channel => normalizeDualApiBaseUrl(channel.endpoint) && selectedDualApiModels(channel).length)
-        .map(channel => `${channel.label}（${selectedDualApiModels(channel).length}模型）`);
+        .map(channel => {
+            const models = selectedDualApiModels(channel).map((model, index) => `${index + 1}.${model}`).join(' → ');
+            return `${channel.label}：${models}`;
+        });
     if (!parts.length) return '<div id="stsc_dual_order" class="stsc-dual-order stsc-muted">当前还没有可执行的自检渠道。</div>';
     return `<div id="stsc_dual_order" class="stsc-dual-order"><span class="stsc-muted">执行顺序：</span>${parts.map(part => `<span class="stsc-status-pill">${escapeHtml(part)}</span>`).join('')}</div>`;
 }
@@ -1040,7 +1069,7 @@ function dualApiModelStatusText(dual) {
     if (!endpoint) return '填写接口地址后，插件会自动读取该接口提供的模型列表。';
     if (dualApiModelsLoading) return '正在连接接口并读取模型列表……';
     if (dualApiModelsError) return dualApiModelsError;
-    if (dualApiModels.length) return `已获取 ${dualApiModels.length} 个可用模型，可直接点选多个；同一接口会按列表顺序依次尝试。`;
+    if (dualApiModels.length) return `已获取 ${dualApiModels.length} 个可用模型；新点选的模型会排到已选列表末尾，可在已选区上移/下移。`;
     return '等待自动获取模型列表。';
 }
 
@@ -1064,7 +1093,7 @@ function dualApiFallbackModelStatusText(item) {
     if (!endpoint) return '填写接口地址后可刷新模型列表。';
     if (state.loading) return '正在读取备用API模型列表……';
     if (state.error) return state.error;
-    if (state.models.length) return `已获取 ${state.models.length} 个可用模型，可直接点选多个。`;
+    if (state.models.length) return `已获取 ${state.models.length} 个可用模型；按已选列表顺序尝试。`;
     return '等待刷新模型列表。';
 }
 
@@ -5349,16 +5378,17 @@ function bindUiEvents() {
         if (normalizeDualApiBaseUrl(dual.endpoint)) scheduleDualApiModelFetch(event.type === 'change' ? 0 : 800);
     });
     $('#stsc_manager_overlay').on('change', '[data-dual-model-option="primary"]', function () {
-        const selected = Array.from(document.querySelectorAll('[data-dual-model-option="primary"]:checked'))
-            .map(option => option.value)
+        const dual = getUiSettings().dualApi;
+        const before = selectedDualApiModels(dual);
+        const after = updateSelectedDualApiModel(dual, this.value, this.checked)
             .filter(value => !dualApiModels.length || dualApiModels.includes(value));
-        if (!selected.length) {
+        if (!after.length || before.join('\n') === after.join('\n')) {
             this.checked = true;
             return;
         }
-        setSelectedDualApiModels(getUiSettings().dualApi, selected);
+        setSelectedDualApiModels(dual, after);
         markDirty();
-        $('#stsc_dual_model_selected').html(dualApiSelectedModelsHtml(getUiSettings().dualApi));
+        $('#stsc_dual_model_selected').html(dualApiSelectedModelsHtml(dual));
         updateDualApiExecutionOrder();
     });
     $('#stsc_manager_overlay').on('input', '[data-dual-model-search="primary"]', function () {
@@ -5425,14 +5455,14 @@ function bindUiEvents() {
         const fallback = getUiSettings().dualApi.fallbacks?.[index];
         if (!fallback) return;
         const state = fallbackModelState(fallback);
-        const selected = Array.from(card.querySelectorAll('[data-dual-fallback-model-option]:checked'))
-            .map(option => option.value)
+        const before = selectedDualApiModels(fallback);
+        const after = updateSelectedDualApiModel(fallback, this.value, this.checked)
             .filter(value => !state.models.length || state.models.includes(value));
-        if (!selected.length) {
+        if (!after.length || before.join('\n') === after.join('\n')) {
             this.checked = true;
             return;
         }
-        setSelectedDualApiModels(fallback, selected);
+        setSelectedDualApiModels(fallback, after);
         markDirty();
         $(card).find('.stsc-dual-fallback-selected').html(dualApiSelectedModelsHtml(fallback));
         updateDualApiExecutionOrder();
@@ -5440,6 +5470,21 @@ function bindUiEvents() {
     $('#stsc_manager_overlay').on('input', '[data-dual-fallback-model-search]', function () {
         const card = this.closest('[data-fallback-index]');
         filterDualApiModelChoices(card?.querySelector('.stsc-model-choice-list'), this.value);
+    });
+    $('#stsc_manager_overlay').on('click', '[data-action="move-selected-model"]', function (event) {
+        event.preventDefault();
+        const card = this.closest('[data-fallback-index]');
+        const dual = getUiSettings().dualApi;
+        const config = card
+            ? dual.fallbacks?.[Number(card.dataset.fallbackIndex)]
+            : dual;
+        if (!config) return;
+        const moved = moveSelectedDualApiModel(config, this.dataset.model, Number(this.dataset.direction) || 0);
+        if (!moved) return;
+        markDirty();
+        if (card) $(card).find('.stsc-dual-fallback-selected').html(dualApiSelectedModelsHtml(config));
+        else $('#stsc_dual_model_selected').html(dualApiSelectedModelsHtml(config));
+        updateDualApiExecutionOrder();
     });
     $('#stsc_manager_overlay').on('click', '[data-action="add-dual-fallback"]', function () {
         const dual = getUiSettings().dualApi;
