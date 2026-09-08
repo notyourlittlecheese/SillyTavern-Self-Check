@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.11';
+const STSC_VERSION = '0.4.12';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -2254,6 +2254,30 @@ function dualApiChatContent(message) {
     return compactPromptText(content);
 }
 
+function currentComposerText() {
+    const selectors = ['#send_textarea', 'textarea#send_textarea', '[name="send_textarea"]', '#send_textarea textarea'];
+    for (const selector of selectors) {
+        const element = document.querySelector(selector);
+        const text = compactPromptText(element?.value ?? element?.textContent ?? '');
+        if (text) return text;
+    }
+    return '';
+}
+
+function chatWithPendingUserInput(chat) {
+    const source = Array.isArray(chat) ? clone(chat) : [];
+    const pendingText = currentComposerText();
+    if (pendingText) {
+        source.push({
+            is_user: true,
+            is_system: false,
+            role: 'user',
+            mes: pendingText,
+        });
+    }
+    return source;
+}
+
 function selectDualApiChat(chat, dual) {
     const source = (Array.isArray(chat) ? clone(chat) : [])
         .map(message => ({ role: dualApiChatRole(message), content: dualApiChatContent(message) }))
@@ -2636,10 +2660,11 @@ async function callDualApiCandidate(
 
 async function callDualApiSelfCheck(
     { chat, questions, references, temporaryInstructions, settings },
-    { compact = false, allowTransientRetry = true, timeoutSecondsOverride = 0 } = {},
+    { compact = false, allowTransientRetry = true, timeoutSecondsOverride = 0, candidateLimit = 0 } = {},
 ) {
     const dual = settings.dualApi;
-    const candidates = getDualApiCandidates(dual);
+    const allCandidates = getDualApiCandidates(dual);
+    const candidates = candidateLimit > 0 ? allCandidates.slice(0, candidateLimit) : allCandidates;
     if (!candidates.length) {
         const hasEndpoint = normalizeDualApiBaseUrl(dual.endpoint);
         if (!hasEndpoint) throw new Error('尚未填写有效的自检API接口地址。');
@@ -4232,8 +4257,8 @@ function renderSettingsTab() {
                 </div>
             </div>
             <div class="stsc-toolbar" style="margin-top:12px">
-                <button class="menu_button" type="button" data-action="test-dual-api-self-check">测试双API自检（不生成正文）</button>
-                <span class="stsc-muted">按当前渠道与模型顺序发起一次独立自检，不调用酒馆主API写正文。</span>
+                <button class="menu_button" type="button" data-action="test-dual-api-self-check">测试首选自检模型（不生成正文）</button>
+                <span class="stsc-muted">只调用执行顺序里的第一个模型一次；会读取当前输入框内容，但不调用酒馆主API写正文。</span>
             </div>
         </div>
 
@@ -5211,20 +5236,22 @@ async function testDualApiSelfCheckOnly() {
 
     testBusy = true;
     const loader = context.loader?.show?.({
-        message: '正在测试双API自检…',
+        message: '正在测试首选自检模型…',
         title: '墨提斯之镜',
         toastMode: 'stoppable',
     });
 
     try {
         clearRuntimePrompts();
+        const testChat = chatWithPendingUserInput(context.chat || []);
+        const pendingInput = currentComposerText();
         const result = await callDualApiSelfCheck({
-            chat: context.chat || [],
+            chat: testChat,
             questions,
             references,
             temporaryInstructions,
             settings,
-        }, { allowTransientRetry: true });
+        }, { allowTransientRetry: false, candidateLimit: 1 });
         const parsed = parseModelOutput(result.text, questions);
         const status = dualParsedIsComplete(parsed, questions) ? 'ok' : parsed.status;
         const issues = (parsed.formatIssues || []).map(plainSelfCheckIssue).filter(Boolean);
@@ -5235,24 +5262,24 @@ async function testDualApiSelfCheckOnly() {
             answer.requireEvidence || answer.evidence ? `依据：${answer.evidence || '（未识别到依据）'}` : '',
         ].filter(Boolean).join('\n')).join('\n\n');
         lastTestResult = [
-            status === 'ok' ? '双API自检测试完成（未生成正文）' : '双API接口已返回，但自检格式未完整识别（未生成正文）',
+            status === 'ok' ? '首选自检模型测试完成（未生成正文）' : '首选自检模型已返回，但自检格式未完整识别（未生成正文）',
             `来源：${result.apiLabel || '未识别渠道'}`,
+            `读取当前输入框：${pendingInput ? '是' : '否，仅使用已保存聊天记录'}`,
             `状态：${statusText(status)}｜${(parsed.answers || []).filter(answer => answer.answer?.trim()).length}/${questions.length} 题`,
-            result.failedApis?.length ? `前置失败：${result.failedApis.map(item => `${item.label}：${item.message}`).join('；')}` : '',
             issues.length ? `格式提示：${issues.join('；')}` : '',
             answers ? `解析出的自检问答：\n${answers}` : '',
             rawReturn ? `原始返回：\n${rawReturn}` : '测试没有返回内容。',
         ].filter(Boolean).join('\n\n');
         if (status === 'ok') {
-            toastr.success(`双API自检测试完成：${result.apiLabel || '已返回结果'}`, '墨提斯之镜');
+            toastr.success(`首选自检模型测试完成：${result.apiLabel || '已返回结果'}`, '墨提斯之镜');
         } else {
-            toastr.warning(`双API接口已返回，但没有完整识别自检格式：${result.apiLabel || '已返回结果'}`, '墨提斯之镜');
+            toastr.warning(`首选自检模型已返回，但没有完整识别自检格式：${result.apiLabel || '已返回结果'}`, '墨提斯之镜');
         }
         renderAll();
     } catch (error) {
         console.error('[STSC] 双API自检测试失败：', error);
-        lastTestResult = `双API自检测试失败：${dualApiFailureMessage(error)}`;
-        toastr.error('双API自检测试失败，请检查渠道、模型和密钥。', '墨提斯之镜');
+        lastTestResult = `首选自检模型测试失败：${dualApiFailureMessage(error)}`;
+        toastr.error('首选自检模型测试失败，请检查当前排第一的渠道、模型和密钥。', '墨提斯之镜');
         renderAll();
     } finally {
         clearRuntimePrompts();
