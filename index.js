@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.12';
+const STSC_VERSION = '0.4.13';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -2476,6 +2476,14 @@ function extractDualApiText(payload) {
     return '';
 }
 
+function isLikelyDualApiErrorText(text) {
+    const value = compactPromptText(text);
+    if (!value || value.length > 500) return false;
+    return /^(?:bad request|unauthorized|forbidden|not found|gateway timeout|bad gateway|service unavailable|internal server error|rate limit|too many requests)$/i.test(value)
+        || /^(?:HTTP\s*)?\d{3}\b/i.test(value)
+        || /(?:invalid request|api key|quota|model .*not found|模型.*不存在|请求.*错误|认证失败|密钥错误)/i.test(value);
+}
+
 function isTransientDualApiFailure(error) {
     if (error?.transient === true) return true;
     if (error?.name === 'TypeError') return true;
@@ -2609,7 +2617,8 @@ async function callDualApiCandidate(
                 payload = { text: responseText };
             }
 
-            if (!response.ok || payload?.error) {
+            const text = extractDualApiText(payload);
+            if ((!response.ok || payload?.error) && (!text || isLikelyDualApiErrorText(text))) {
                 const providerMessage = dualApiProviderErrorText(payload, responseText);
                 const error = new Error(`${response.status ? `HTTP ${response.status}：` : ''}${providerMessage || '自检API返回错误。'}`);
                 error.httpStatus = response.status;
@@ -2617,12 +2626,12 @@ async function callDualApiCandidate(
                 throw error;
             }
 
-            const text = extractDualApiText(payload);
             if (!text) {
                 const error = new Error('自检API返回成功，但没有读取到任何文本。');
                 error.transient = true;
                 throw error;
             }
+            const providerWarning = (!response.ok || payload?.error) ? dualApiProviderErrorText(payload, responseText) : '';
             return {
                 text,
                 attempts: attempt + 1,
@@ -2630,6 +2639,7 @@ async function callDualApiCandidate(
                 apiLabel: candidate.label,
                 apiName: candidate.apiName || candidate.label,
                 model,
+                providerWarning,
             };
         } catch (caught) {
             let error = caught instanceof Error ? caught : new Error(String(caught || '未知错误'));
@@ -2676,6 +2686,9 @@ async function callDualApiSelfCheck(
         const candidate = candidates[index];
         try {
             const result = await callDualApiCandidate(candidate, { chat, questions, references, temporaryInstructions, settings }, { compact, allowTransientRetry, timeoutSecondsOverride });
+            if (result.providerWarning) {
+                addRuntimeLog('warning', '自检API', `${candidate.label}返回了可用文本，但接口同时附带错误提示；插件已停止继续尝试后续模型。`, result.providerWarning);
+            }
             if (index > 0) {
                 addRuntimeLog('warning', '自检API', `${candidate.label}调用成功；前面的接口失败，已自动切换。`, failures.map(item => `${item.label}：${item.message}`).join('；'));
             }
@@ -3186,6 +3199,7 @@ function makeLatestResult({ parsed, questions, mode, messageId, rawOverride = ''
             label: String(dualApiResult.apiLabel || '').trim(),
             apiName: String(dualApiResult.apiName || '').trim(),
             model: String(dualApiResult.model || '').trim(),
+            providerWarning: String(dualApiResult.providerWarning || '').trim(),
             attempts: Math.max(1, Number(dualApiResult.attempts) || 1),
             compact: Boolean(dualApiResult.compact),
             failedApis: Array.isArray(dualApiResult.failedApis) ? dualApiResult.failedApis : [],
@@ -3625,6 +3639,7 @@ function dualApiSourceMetaHtml(latest) {
     const details = [];
     if (source.attempts > 1) details.push(`重试 ${source.attempts - 1} 次`);
     if (source.compact) details.push('精简上下文');
+    if (source.providerWarning) details.push('接口附带警告');
     if (source.failedApis?.length) details.push(`前置失败 ${source.failedApis.length} 个`);
     return `
         <div class="stsc-source-meta">
@@ -5265,6 +5280,7 @@ async function testDualApiSelfCheckOnly() {
             status === 'ok' ? '首选自检模型测试完成（未生成正文）' : '首选自检模型已返回，但自检格式未完整识别（未生成正文）',
             `来源：${result.apiLabel || '未识别渠道'}`,
             `读取当前输入框：${pendingInput ? '是' : '否，仅使用已保存聊天记录'}`,
+            result.providerWarning ? `接口警告：${result.providerWarning}` : '',
             `状态：${statusText(status)}｜${(parsed.answers || []).filter(answer => answer.answer?.trim()).length}/${questions.length} 题`,
             issues.length ? `格式提示：${issues.join('；')}` : '',
             answers ? `解析出的自检问答：\n${answers}` : '',
