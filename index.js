@@ -3,7 +3,7 @@ import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSi
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.15';
+const STSC_VERSION = '0.4.16';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -185,7 +185,6 @@ let expandedInstructionIds = new Set();
 let floatingPanelPage = 'check';
 let pendingDeleteRequest = null;
 let updateCheckInFlight = false;
-let updatePollTimer = null;
 let updateToast = null;
 let updateAvailableVersion = '';
 let gitUpdateAvailable = false;
@@ -3874,8 +3873,7 @@ function renderQuestionCards(preset) {
                     <label>问题内容</label>
                     <textarea class="text_pole stsc-textarea" data-question-field="text">${escapeHtml(question.text)}</textarea>
                 </div>
-                ${providerControlsHtml(item, item.id)}
-            <div class="stsc-grid-3" style="margin-top:9px">
+                <div class="stsc-grid-3" style="margin-top:9px">
                     <div class="stsc-field">
                         <label>问题类型</label>
                         <select class="text_pole" data-question-field="type">
@@ -4066,8 +4064,7 @@ function renderReferencesTab() {
                     <div class="stsc-section stsc-reference-injection-section">
                         <div class="stsc-section-title">注入设置</div>
                         <div class="stsc-muted">创建时已按“${config.label}”自动选择推荐位置，仍可手动调整。</div>
-                        ${providerControlsHtml(item, item.id)}
-            <div class="stsc-grid-3" style="margin-top:9px">
+                        <div class="stsc-grid-3" style="margin-top:9px">
                             <div class="stsc-field">
                                 <label>注入位置</label>
                                 <select class="text_pole" data-reference-field="position">
@@ -4462,8 +4459,10 @@ function renderUpdatesTab() {
                 <button class="menu_button" type="button" data-action="open-sillytavern-extensions" data-dialog-action="open-sillytavern-extensions"><i class="fa-solid fa-puzzle-piece"></i> 打开酒馆扩展页面</button>
             </div>
         </div>`;
+    } else if (updateCheckState !== 'latest') {
+        remoteHtml = '<div class="stsc-update-card"><b>尚未检查远程版本。</b><div class="stsc-muted">自动更新与后台检查已关闭；需要时请手动点击“检查更新”。</div></div>';
     } else {
-        remoteHtml = '<div class="stsc-update-card is-latest"><b>当前已经是最新版本。</b><div class="stsc-muted">插件启动、打开管理器以及后台定时检查时都会自动检测新版本。</div></div>';
+        remoteHtml = '<div class="stsc-update-card is-latest"><b>当前已经是最新版本。</b><div class="stsc-muted">自动更新与后台检查已关闭；需要时请手动点击“检查更新”。</div></div>';
     }
 
     $('#stsc_tab_updates').html(`
@@ -4696,7 +4695,6 @@ function renderAll() {
 }
 
 function openManager(tab = null) {
-    void checkForPluginUpdate({ force: true });
     if (!editDraft) beginEditSession();
     const settings = getUiSettings();
     if (tab) settings.ui.activeTab = tab;
@@ -6703,6 +6701,8 @@ async function updatePluginFromManager({ skipCheck = false } = {}) {
 }
 
 async function checkForPluginUpdate({ force = false, userInitiated = false } = {}) {
+    // Only an explicit user action may contact update services.
+    if (!userInitiated) return;
     if (updateCheckInFlight) return;
 
     const now = Date.now();
@@ -6817,9 +6817,6 @@ async function initialize() {
 
     renderAll();
     markInstalledReleaseSeen();
-    setTimeout(() => void checkForPluginUpdate({ force: true }), 2500);
-    if (updatePollTimer) clearInterval(updatePollTimer);
-    updatePollTimer = setInterval(() => void checkForPluginUpdate(), STSC_UPDATE_CHECK_INTERVAL_MS);
     console.info(`[STSC] 墨提斯之镜 v${STSC_VERSION} 已加载。`);
 }
 

@@ -300,3 +300,49 @@ test('provider controls cover all providers on primary and fallback channels wit
     }
     assert.equal(h.calls.length,0);
 });
+
+test('manager renders every tab with populated questions and references', () => {
+    const html = new Map();
+    const chain = new Proxy({}, { get: (_, key) => key === 'length' ? 0 : () => chain });
+    const scope = vm.createContext({
+        ...adapters, console, structuredClone, AbortController, URL, Blob,
+        jQuery() {},
+        $(selector) { return new Proxy({}, { get: (_, key) => key === 'length' ? 0 : key === 'html' ? value => { html.set(selector, value); return chain; } : () => chain }); },
+        SillyTavern: { getContext: () => ({ extensionSettings: {}, chat: [] }) },
+        setTimeout() {}, clearTimeout() {},
+        document: { getElementById() { return null; }, querySelector() { return null; }, querySelectorAll() { return []; } },
+        window: { innerWidth: 1200, innerHeight: 800, matchMedia: () => ({matches:false}) },
+    });
+    vm.runInContext(source, scope);
+    vm.runInContext(`
+        const fixture = structuredClone(DEFAULT_SETTINGS);
+        fixture.presets = [createBuiltInGeneralPreset()];
+        fixture.references = [{id:'ref',name:'REFERENCE_SENTINEL',type:'restriction',enabled:true,scope:'global',content:'REFERENCE_CONTENT',position:'chat',depth:0,role:'system'}];
+        fixture.temporaryInstructions = [{id:'temp',name:'COMMAND_SENTINEL',content:'COMMAND_CONTENT'}];
+        fixture.dualApi.fallbacks = [{id:'fallback',provider:'custom',endpoint:'https://example.test/v1',models:['test-model'],apiKey:''}];
+        fixture.mode = 'dual_api';
+        normalizeSettings = () => fixture;
+        initialized = true;
+        renderAll();
+    `, scope);
+    for (const tab of ['status','presets','references','temporary','settings','appearance','updates']) {
+        assert.ok(html.get('#stsc_tab_' + tab)?.length > 100, tab + ' must render');
+    }
+    assert.ok(html.get('#stsc_tab_updates').includes('尚未检查远程版本'));
+    assert.ok(html.get('#stsc_tab_presets').includes('data-question-id'));
+    assert.ok(html.get('#stsc_tab_references').includes('REFERENCE_SENTINEL'));
+    assert.ok(!html.get('#stsc_tab_presets').includes('data-stsc-provider'));
+    assert.ok(!html.get('#stsc_tab_references').includes('data-stsc-provider'));
+});
+
+test('background and forced non-user update checks perform no network requests', async () => {
+    const h = harness();
+    h.scope.fetch = () => { throw Error('Unexpected update network request'); };
+    h.run("getInstalledExtensionType = () => { throw Error('Unexpected extension lookup'); };");
+    await h.run('checkForPluginUpdate()');
+    await h.run('checkForPluginUpdate({force:true})');
+    assert.equal(h.run('updateCheckInFlight'), false);
+    assert.equal(JSON.parse(fs.readFileSync(require('node:path').join(__dirname, '../manifest.json'), 'utf8')).auto_update, false);
+    assert.ok(!source.includes('updatePollTimer'));
+    assert.ok(!source.includes('setTimeout(() => void checkForPluginUpdate'));
+});

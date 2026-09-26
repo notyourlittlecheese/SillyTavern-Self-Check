@@ -4,8 +4,8 @@
   "js": "index.js",
   "css": "style.css",
   "author": "chenxyeah",
-  "version": "0.4.15",
+  "version": "0.4.16",
   "homePage": "https://github.com/notyourlittlecheese/SillyTavern-Self-Check",
-  "auto_update": true,
+  "auto_update": false,
   "generate_interceptor": "sillyTavernSelfCheckInterceptor"
 }
