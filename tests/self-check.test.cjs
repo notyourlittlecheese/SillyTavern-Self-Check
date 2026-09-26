@@ -1,8 +1,10 @@
-const { test } = require('node:test');
+const { test, before } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
-const source = fs.readFileSync(require('node:path').join(__dirname, '../index.js'), 'utf8');
+const source = fs.readFileSync(require('node:path').join(__dirname, '../index.js'), 'utf8').replace(/^import[^;]+;\r?\n/gm, '');
+let adapters;
+before(async () => { adapters = await import('../api-providers.mjs'); });
 
 function harness() {
     const timers = new Map();
@@ -13,6 +15,7 @@ function harness() {
     } };
     const context = { chat: [{ is_user: true, mes: 'request' }], chatId: 'chat-a', extensionSettings: { sillytavern_self_check: settings }, setExtensionPrompt() {} };
     const scope = vm.createContext({
+        ...adapters,
         console: { warn() {}, error() {}, info() {} }, structuredClone, AbortController, URL, Blob,
         jQuery() {}, $: () => ({ text() {}, html() {} }), toastr: { warning() {}, success() {}, error() {} },
         SillyTavern: { getContext: () => context },
@@ -198,4 +201,102 @@ test('slow diagnostic storage never blocks capture before main request', async (
     h.run('saveDiagnostic = () => new Promise(() => {});');
     assert.equal(h.run("captureRealRequest({type:'normal',messages:[{role:'user',content:'real'}]})"), undefined);
     assert.equal(h.run('latestSnapshot.messages[0].content'), 'real');
+});
+
+test('hidden last assistant reply retains preceding user input in every context mode', async () => {
+    for (const contextMode of ['recent5', 'custom', 'all']) {
+        const h = harness();
+        h.settings.dualApi.contextMode = contextMode;
+        h.settings.dualApi.customTurns = 1;
+        h.context.chat = [
+            { is_user: true, is_system: false, mes: 'FLOOR100_VISIBLE_USER_INPUT' },
+            { is_user: false, is_system: true, mes: 'FLOOR101_HIDDEN_ANSWER' },
+        ];
+        // SillyTavern removes hidden messages before calling extension interceptors.
+        h.scope.outgoingChat = h.context.chat.filter(message => !message.is_system);
+        // A normal generation must not read or require the composer.
+        h.scope.document = { querySelector() { throw Error('Unexpected composer read'); } };
+        h.mock(() => h.response(200, { text: h.good }));
+        await h.run("sillyTavernSelfCheckInterceptor(outgoingChat, 0, () => { throw Error('Unexpected abort'); }, 'normal')");
+        assert.equal(h.calls.length, 1);
+        const userMessages = h.calls[0].messages.filter(message => message.role === 'user');
+        assert.ok(userMessages.some(message => message.content === 'FLOOR100_VISIBLE_USER_INPUT'));
+        assert.ok(!JSON.stringify(h.calls[0]).includes('FLOOR101_HIDDEN_ANSWER'));
+        assert.equal(h.run('pendingRun.targetMessageFloor'), 2);
+    }
+});
+
+test('direct generation without a new user message preserves the latest user turn', async () => {
+    const h = harness();
+    h.context.chat = [
+        { is_user: true, is_system: false, mes: 'LAST_USER_INPUT' },
+        { is_user: false, is_system: false, mes: 'VISIBLE_ANSWER' },
+    ];
+    h.scope.outgoingChat = h.context.chat;
+    h.scope.document = { querySelector() { throw Error('Unexpected composer read'); } };
+    h.mock(() => h.response(200, { text: h.good }));
+    await h.run("sillyTavernSelfCheckInterceptor(outgoingChat, 0, () => {}, 'normal')");
+    assert.ok(h.calls[0].messages.some(message => message.role === 'user' && message.content === 'LAST_USER_INPUT'));
+});
+
+test('mixed-provider fallback uses the second channel protocol and preserves two-request limit', async () => {
+    const h = harness(); h.settings.dualApi.models = ['first'];
+    h.settings.dualApi.fallbacks = [{ id:'native',provider:'claude',endpoint:'https://api.anthropic.com/v1',apiKey:'native-secret',models:['claude-sonnet-4-6'] }];
+    h.mock(n => n === 1 ? h.response(401, {error:'invalid key'}) : h.response(200,{content:[{type:'text',text:h.good}]}));
+    const result = await h.call();
+    assert.equal(h.calls.length,2); assert.equal(h.calls[1].chat_completion_source,'claude');
+    assert.equal(h.calls[1].use_sysprompt,true); assert.equal(h.calls[1].proxy_password,'native-secret');
+    assert.equal(result.text,h.good);
+});
+
+test('channel provider switch clears all selected models and secrets only on that channel', () => {
+    const h = harness(); h.settings.dualApi.fallbacks = [{id:'native',provider:'custom',apiKey:'old-secret',model:'old',models:['old','old2']}];
+    h.run("changeChannelProvider = changeChannelProvider; resetDualApiModelState = () => {};");
+    h.run("changeChannelProvider(settings.dualApi.fallbacks[0], 'gemini')");
+    assert.equal(h.settings.dualApi.apiKey,'private-test-key');
+    assert.equal(h.settings.dualApi.fallbacks[0].apiKey,'');
+    assert.equal(h.settings.dualApi.fallbacks[0].models.length,0);
+    assert.equal(h.settings.dualApi.fallbacks[0].endpoint,adapters.API_PROVIDERS.gemini.endpoint);
+});
+
+test('connection test sends only the isolated probe, does not replace generation diagnostics', async () => {
+    const h = harness(); h.run("renderSettingsTab = () => {}; beginDetailedRun('generation');");
+    const id = h.run('detailedRun.id'); h.mock(() => h.response(200,{text:'OK'}));
+    await h.run("testProviderChannel('primary')");
+    assert.equal(h.calls.length,1); assert.deepEqual(h.calls[0].messages,[{role:'user',content:'Reply with OK only.'}]);
+    assert.equal(h.run('detailedRun.id'),id); assert.equal(h.run("providerConnectionResults.get('primary').message"),'连接成功，已收到最终文本。');
+});
+
+test('manual model IDs remain selectable when absent from the remote list', () => {
+    const h = harness();
+    const html = h.run("dualApiModelChoicesHtml(settings.dualApi, ['remote-only'], {}, '')");
+    assert.ok(html.includes('first')); assert.ok(html.includes('second')); assert.ok(html.includes('remote-only'));
+});
+
+test('manual model selections survive refresh and obsolete discovery results are ignored', async () => {
+    const h = harness();
+    h.run("updateDualApiModelControl = () => {}; markDirty = () => {}; fetchDualApiModelList = () => new Promise(resolve => { globalThis.resolveModels = resolve; });");
+    const pending = h.run('fetchDualApiModels({force:true})');
+    h.run('resetDualApiModelState()'); h.scope.resolveModels(['remote-only']); await pending;
+    assert.equal(h.run('dualApiModels.length'),0); assert.deepEqual(h.settings.dualApi.models,['first','second','third']);
+    h.run("fetchDualApiModelList = async () => ['remote-only'];"); await h.run('fetchDualApiModels({force:true})');
+    assert.deepEqual(h.settings.dualApi.models,['first','second','third']);
+});
+
+test('imported greetings and ordinary code fences remain untouched', async () => {
+    const h = harness(); const original = '```html\n<div>greeting</div>\n```';
+    h.context.chat = [{is_user:false,mes:original}];
+    await h.run('handleMessageReceived(0)'); assert.equal(h.context.chat[0].mes,original);
+    h.scope.original = original;
+    assert.equal(h.run('normalizeModelXmlText(original).source'),original);
+});
+
+test('provider controls cover all providers on primary and fallback channels without requests', () => {
+    const h = harness();
+    for (const key of ['primary','fallback-id']) {
+        const html = h.run(`providerControlsHtml(settings.dualApi, '${key}')`);
+        for (const id of Object.keys(adapters.API_PROVIDERS)) assert.ok(html.includes(`value="${id}"`));
+        assert.ok(html.includes(`data-stsc-models="${key}"`)); assert.ok(html.includes(`data-stsc-probe="${key}"`));
+    }
+    assert.equal(h.calls.length,0);
 });
