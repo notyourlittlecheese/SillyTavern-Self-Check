@@ -103,3 +103,27 @@ for (const [id, provider] of Object.entries(API_PROVIDERS)) {
         assert.deepEqual(extractModelIds(reply.body, config), [id === 'gemini' ? 'gemini-text' : 'text-model']);
     });
 }
+
+test('native QR set executes toggle as a command without sending or modifying composer text', {skip:!stRoot}, async () => {
+    const composer={value:'UNSENT_DRAFT'};
+    const commands=[];
+    const scope=vm.createContext({
+        debounceAsync: fn=>fn,
+        QuickReply: {from: props=>({...props})},
+        fetch: async()=>({ok:true}), getRequestHeaders:()=>({}),
+        document: {querySelector(selector) { if(selector==='#send_textarea') return composer; throw Error('Unexpected DOM access: '+selector); }},
+        executeSlashCommandsOnChatInput: async (command)=>{commands.push(command.trim());return {pipe:''};},
+    });
+    for(const file of ['src/QuickReplySet.js','api/QuickReplyApi.js']) {
+        vm.runInContext(stripModule(readFileSync(join(stRoot,'public/scripts/extensions/quick-reply',file),'utf8')),scope);
+    }
+    await vm.runInContext(`(async()=>{
+        const api=new QuickReplyApi({}, {rerender(){}});
+        const set=await api.createSet('test',{disableSend:false,injectInput:false,placeBeforeInput:false});
+        const qr=api.createQuickReply('test','1.0',{message:'/stsc-preset-toggle preset_a',showLabel:true,isHidden:false});
+        if(qr.executeOnStartup || qr.executeOnUser || qr.executeOnAi || qr.executeOnChatChange || qr.executeBeforeGeneration) throw Error('QR must not auto-execute');
+        await set.execute(qr);
+    })()`,scope);
+    assert.deepEqual(commands,['/stsc-preset-toggle preset_a']);
+    assert.equal(composer.value,'UNSENT_DRAFT');
+});

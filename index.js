@@ -3,7 +3,7 @@ import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSi
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.17';
+const STSC_VERSION = '0.4.18';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -798,6 +798,120 @@ function activateGeneralPreset(settings, preset) {
     settings.generalPresetId = preset.id;
     settings.generalEnabled = true;
     syncPresetApiConfig(settings);
+}
+
+const STSC_QR_SET = '墨提斯之镜 · 预设开关';
+let presetQrRegistered = false;
+let presetQrCreating = false;
+
+function presetQrNotice(level, message) {
+    toastr[level](message, '墨提斯之镜', { positionClass: 'toast-top-center', escapeHtml: true });
+}
+
+function togglePresetFromQr(id) {
+    const settings = normalizeSettings();
+    const preset = settings?.presets.find(item => item.id === id && item.kind === 'general');
+    if (!preset) {
+        presetQrNotice('warning', '这个 QR 对应的通用预设已不存在，请重新创建 QR。');
+        return '';
+    }
+    if (editDirty) {
+        presetQrNotice('warning', '插件里还有未保存的修改，请先保存或放弃，再使用 QR。');
+        return '';
+    }
+    if (dualApiBusy || testBusy || providerConnectionBusy || pendingRun) {
+        presetQrNotice('warning', '本轮自检或生成尚未结束，请结束后再切换预设或开关。');
+        return '';
+    }
+    const turnOff = settings.enabled && settings.generalEnabled && preset.enabled !== false && settings.generalPresetId === preset.id;
+    if (turnOff) {
+        settings.enabled = false;
+        clearRuntimePrompts();
+    } else {
+        activateGeneralPreset(settings, preset);
+        preset.enabled = true;
+        settings.enabled = true;
+    }
+    saveSettings();
+    if (editDraft) editDraft = clone(settings);
+    renderAll();
+    presetQrNotice('success', turnOff ? `已关闭墨提斯之镜（${preset.name}）。` : `已启用“${preset.name}”，已同步其 API 配置。`);
+    return '';
+}
+
+function registerPresetQrCommand() {
+    if (presetQrRegistered) return true;
+    const context = ctx();
+    if (!context?.SlashCommandParser?.addCommandObject || !context?.SlashCommand?.fromProps
+        || !context?.SlashCommandArgument?.fromProps || !context?.ARGUMENT_TYPE?.STRING) return false;
+    context.SlashCommandParser.addCommandObject(context.SlashCommand.fromProps({
+        name: 'stsc-preset-toggle',
+        callback: (_args, value) => {
+            try { return togglePresetFromQr(decodeURIComponent(String(value || '').trim())); }
+            catch (error) { presetQrNotice('error', '无法切换预设，请检查预设是否仍然存在。'); return ''; }
+        },
+        unnamedArgumentList: [context.SlashCommandArgument.fromProps({
+            description: '通用预设 ID（由插件创建 QR 时自动填写）',
+            typeList: [context.ARGUMENT_TYPE.STRING], isRequired: true,
+        })],
+        helpString: '启用指定通用预设及其 API；再次点击同一生效预设则关闭墨提斯之镜。',
+    }));
+    presetQrRegistered = true;
+    return true;
+}
+
+function openPresetQrDialog(preset) {
+    if (preset?.kind !== 'general') return;
+    openDialog('创建预设快速回复 QR', `
+        <div>预设：<b>${escapeHtml(preset.name)}</b></div>
+        <div class="stsc-field" style="margin-top:10px"><label>QR 按钮名称</label>
+        <input id="stsc_qr_label" class="text_pole" maxlength="80" value="${escapeHtml(preset.name)}"></div>
+        <input id="stsc_qr_preset_id" type="hidden" value="${escapeHtml(preset.id)}">
+        <div class="stsc-muted">创建到酒馆原生“${STSC_QR_SET}”集合并显示。点一次启用此预设和 API，再点关闭插件；点其他预设的 QR 切换。可创建多个按钮，之后在酒馆快速回复设置里改名或删除。</div>`,
+        '<button class="menu_button" data-dialog-action="cancel">取消</button><button class="menu_button" data-dialog-action="create-preset-qr">创建 QR</button>');
+}
+
+async function createPresetQr(id, label) {
+    if (presetQrCreating) return false;
+    presetQrCreating = true;
+    try {
+        if (editDirty) throw new Error('请先保存预设和 API 配置，再创建 QR。');
+        const preset = normalizeSettings()?.presets.find(item => item.id === id && item.kind === 'general');
+        if (!preset) throw new Error('请先保存这套通用预设，再创建 QR。');
+        label = String(label || '').trim();
+        if (!label || label.length > 80) throw new Error('请输入 1～80 字的 QR 名称。');
+        const api = globalThis.quickReplyApi;
+        if (!api?.createSet || !api?.createQuickReply || !api?.settings?.save || !registerPresetQrCommand()) {
+            throw new Error('酒馆原生快速回复尚未加载，请在扩展中启用快速回复后重试。');
+        }
+        let set = api.getSetByName(STSC_QR_SET);
+        if (set && (set.disableSend || set.injectInput)) throw new Error('此 QR 集合设置已被修改，请在快速回复设置中关闭“禁止发送”和“注入输入”后重试。');
+        if (set && api.getQrByLabel(STSC_QR_SET, label)) throw new Error('已有同名 QR，请换个名称；原按钮不会被覆盖。');
+        if (!set) set = await api.createSet(STSC_QR_SET, { disableSend: false, injectInput: false, placeBeforeInput: false });
+        api.createQuickReply(STSC_QR_SET, label, {
+            message: `/stsc-preset-toggle ${encodeURIComponent(preset.id)}`,
+            title: `切换“${preset.name}”及其 API；再次点击关闭墨提斯之镜`,
+            showLabel: true, isHidden: false,
+        });
+        await set.save();
+        // Native save() logs HTTP failures without rejecting; verify this write before reporting success.
+        const response = await fetch('/api/quick-replies/save', {
+            method: 'POST', headers: ctx().getRequestHeaders(), body: JSON.stringify(set),
+        });
+        if (!response.ok) throw new Error('酒馆保存 QR 失败，请到快速回复设置检查并保存该集合。');
+        api.addGlobalSet(STSC_QR_SET, true);
+        const link = api.settings.config.setList.find(item => item.set === set);
+        if (link) link.isVisible = true;
+        api.settings.isEnabled = true;
+        api.settings.save();
+        presetQrNotice('success', `已创建 QR“${label}”，可在聊天框旁使用。`);
+        return true;
+    } catch (error) {
+        presetQrNotice('error', error?.message || '创建 QR 失败，请稍后重试。');
+        return false;
+    } finally {
+        presetQrCreating = false;
+    }
 }
 
 function createPreset(name = '新自检预设', kind = 'general') {
@@ -4053,6 +4167,7 @@ function renderPresetsTab() {
             </div>
             <div class="stsc-toolbar">
                 <button class="menu_button" type="button" data-action="set-general-preset" ${settings.generalPresetId === preset.id ? 'disabled' : ''}>${settings.generalPresetId === preset.id ? '当前通用预设' : '设为当前通用预设'}</button>
+                <button class="menu_button" type="button" data-action="create-preset-qr">创建快速回复 QR</button>
                 <button class="menu_button" type="button" data-action="test-preset">测试当前实际生效问题（调用一次API）</button>
             </div>` : `
             <div class="stsc-binding-box ${binding.status === 'missing' ? 'stsc-binding-missing' : ''}">
@@ -6137,6 +6252,9 @@ function bindUiEvents() {
                 },
             });
             return;
+        } else if (action === 'create-preset-qr' && preset?.kind === 'general') {
+            openPresetQrDialog(preset);
+            return;
         } else if (action === 'set-general-preset' && preset?.kind === 'general') {
             activateGeneralPreset(settings, preset);
             toastr.success(`已将“${preset.name}”设为当前通用预设。`, '墨提斯之镜');
@@ -6293,10 +6411,14 @@ function bindUiEvents() {
         }
     });
 
-    $('#stsc_dialog_overlay').on('click', '[data-dialog-action]', function () {
+    $('#stsc_dialog_overlay').on('click', '[data-dialog-action]', async function () {
         const action = $(this).data('dialog-action');
         const settings = getUiSettings();
 
+        if (action === 'create-preset-qr') {
+            if (await createPresetQr(String($('#stsc_qr_preset_id').val()), $('#stsc_qr_label').val())) closeDialog();
+            return;
+        }
         if (action === 'confirm-import-dev-settings' || action === 'confirm-restore-dev-migration') {
             const restore = action === 'confirm-restore-dev-migration';
             try {
@@ -6937,6 +7059,7 @@ async function initialize() {
     removeLegacyMessageBadges();
     initialized = true;
     bindUiEvents();
+    registerPresetQrCommand();
     addExtensionsMenuButton();
     const events = context.eventTypes || context.event_types;
     context.eventSource.on(events.MESSAGE_RECEIVED, handleMessageReceived);

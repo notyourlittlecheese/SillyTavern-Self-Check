@@ -465,3 +465,109 @@ test('saved preset bindings survive full normalization and reload', () => {
     assert.equal(saved.dualApi.timeoutSeconds, 300);
     assert.equal(saved.presets.find(p => p.name === 'second').apiConfig.dualApi.apiKey, 'second-secret');
 });
+
+function qrHarness() {
+    const h = harness();
+    const notices = [];
+    h.scope.toastr = Object.fromEntries(['success','warning','error'].map(level => [level, (message, title, options) => notices.push({level,message,options})]));
+    h.run(`settings.presets = [createPreset('1.0','general'), createPreset('2.0','general')];
+        settings.generalPresetId = settings.presets[0].id; settings.generalEnabled = true;
+        syncPresetApiConfig(settings); settings.presets[1].apiConfig.dualApi.apiKey = 'second-secret';
+        settings.enabled = false; saveSettings = () => { globalThis.savedCount = (globalThis.savedCount || 0) + 1; };
+        clearRuntimePrompts = () => {};`);
+    let command;
+    h.context.SlashCommandParser = {addCommandObject(value) { command = value; }};
+    h.context.SlashCommand = {fromProps: value => value};
+    h.context.SlashCommandArgument = {fromProps: value => value};
+    h.context.ARGUMENT_TYPE = {STRING:'string'};
+    h.context.getRequestHeaders = () => ({'Content-Type':'application/json'});
+    const sets = new Map();
+    const api = {
+        settings: {isEnabled:false,config:{setList:[]},save() {}},
+        getSetByName: name => sets.get(name),
+        getQrByLabel: (name,label) => sets.get(name)?.qrList.find(q => q.label === label),
+        async createSet(name, options) { const set = {name,...options,qrList:[],save:async()=>{}}; sets.set(name,set); return set; },
+        createQuickReply(name,label,props) { const qr = {label,...props}; sets.get(name).qrList.push(qr); return qr; },
+        addGlobalSet(name,isVisible) { const set=sets.get(name); if (!api.settings.config.setList.some(x=>x.set===set)) api.settings.config.setList.push({set,isVisible}); },
+    };
+    h.scope.quickReplyApi = api;
+    const writes=[];
+    h.scope.fetch = async (url, init) => { writes.push({url,body:JSON.parse(init.body)}); return {ok:true}; };
+    return {...h,notices,api,sets,writes,getCommand:()=>command};
+}
+
+test('native QR command enables 1.0, toggles off, switches to 2.0 with its API and notifies at top', () => {
+    const h=qrHarness(); h.run('registerPresetQrCommand()');
+    const command=h.getCommand(); assert.equal(command.name,'stsc-preset-toggle');
+    const [a,b]=h.settings.presets;
+    const click=p=>command.callback({},encodeURIComponent(p.id));
+    assert.equal(click(a),''); assert.equal(h.settings.enabled,true);
+    assert.equal(h.settings.dualApi.apiKey,'private-test-key');
+    click(a); assert.equal(h.settings.enabled,false);
+    click(a); click(b); assert.equal(h.settings.enabled,true);
+    assert.equal(h.settings.generalPresetId,b.id); assert.equal(h.settings.dualApi.apiKey,'second-secret');
+    click(b); assert.equal(h.settings.enabled,false);
+    assert.equal(h.notices.length,5);
+    assert.ok(h.notices.every(n=>n.options.positionClass==='toast-top-center' && n.options.escapeHtml));
+    assert.equal(h.calls.length,0);
+});
+
+test('QR ID survives rename and deleted presets, dirty drafts and active runs do not change configuration', () => {
+    const h=qrHarness(); const id=h.settings.presets[0].id; h.scope.id=id;
+    h.settings.presets[0].name='renamed'; h.run('togglePresetFromQr(id)');
+    assert.ok(h.notices.at(-1).message.includes('renamed'));
+    h.run('editDirty = true; togglePresetFromQr(id)'); assert.equal(h.settings.enabled,true);
+    h.run('editDirty = false; dualApiBusy = true; togglePresetFromQr(id)'); assert.equal(h.settings.enabled,true);
+    h.run('dualApiBusy = false; pendingRun = {}; togglePresetFromQr(id)'); assert.equal(h.settings.enabled,true);
+    h.run('pendingRun = null; settings.presets.shift(); togglePresetFromQr(id)'); assert.equal(h.settings.enabled,true);
+    assert.equal(h.notices.at(-1).level,'warning');
+});
+
+test('QR enables a disabled general preset and refreshes a clean editor draft', () => {
+    const h=qrHarness();
+    h.run(`settings.enabled = true; settings.generalEnabled = false; settings.presets[0].enabled = false;
+        editDraft = clone(settings); togglePresetFromQr(settings.presets[0].id);`);
+    assert.equal(h.settings.enabled,true); assert.equal(h.settings.generalEnabled,true);
+    assert.equal(h.settings.presets[0].enabled,true);
+    assert.equal(h.run('editDraft.enabled'),true);
+    h.run('togglePresetFromQr(settings.presets[1].id)');
+    assert.equal(h.run('editDraft.generalPresetId'),h.settings.presets[1].id);
+    assert.equal(h.run('editDraft.dualApi.apiKey'),'second-secret');
+});
+
+test('creates multiple native named QR buttons containing only preset IDs, enables visible global set', async () => {
+    const h=qrHarness();
+    assert.equal(await h.run("createPresetQr(settings.presets[0].id, '1.0')"),true);
+    const set=[...h.sets.values()][0];
+    h.api.settings.config.setList[0].isVisible=false;
+    assert.equal(await h.run("createPresetQr(settings.presets[1].id, '2.0')"),true);
+    assert.equal(set.qrList.length,2);
+    assert.equal(set.qrList[0].message,'/stsc-preset-toggle '+encodeURIComponent(h.settings.presets[0].id));
+    assert.equal(set.disableSend,false); assert.equal(set.injectInput,false);
+    assert.equal(h.api.settings.isEnabled,true);
+    assert.equal(h.api.settings.config.setList.length,1);
+    assert.equal(h.api.settings.config.setList[0].isVisible,true);
+    assert.ok(!JSON.stringify(h.writes).includes('private-test-key'));
+    assert.ok(!JSON.stringify(h.writes).includes('second-secret'));
+    assert.equal(await h.run("createPresetQr(settings.presets[1].id, '1.0')"),false);
+    assert.equal(set.qrList.length,2);
+});
+
+test('QR creation handles unavailable native extension, unsaved presets, save failure and duplicate clicks', async () => {
+    const h=qrHarness();
+    h.scope.quickReplyApi=null;
+    assert.equal(await h.run("createPresetQr(settings.presets[0].id,'test')"),false);
+    h.scope.quickReplyApi=h.api;
+    h.run('editDirty=true');
+    assert.equal(await h.run("createPresetQr(settings.presets[0].id,'test')"),false);
+    h.run('editDirty=false');
+    h.scope.fetch=async()=>({ok:false});
+    assert.equal(await h.run("createPresetQr(settings.presets[0].id,'test')"),false);
+    assert.equal(h.notices.at(-1).level,'error');
+    let resolveSave;
+    h.scope.fetch=()=>new Promise(resolve=>{resolveSave=resolve;});
+    const pending=h.run("createPresetQr(settings.presets[0].id,'next')");
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(await h.run("createPresetQr(settings.presets[0].id,'next')"),false);
+    resolveSave({ok:true}); assert.equal(await pending,true);
+});
