@@ -23,7 +23,7 @@ function harness() {
         clearTimeout(id) { timers.delete(id); }, settings,
     });
     vm.runInContext(source, scope);
-    vm.runInContext(`const realSaveDiagnostic = saveDiagnostic; normalizeSettings = () => settings;
+    vm.runInContext(`const realSaveDiagnostic = saveDiagnostic; const realNormalizeSettings = normalizeSettings; normalizeSettings = () => settings;
         saveDiagnostic = async () => {}; addRuntimeLog = () => {}; renderAll = () => {};
         getDualApiCharacterContext = () => 'card'; getReviewSource = () => null;
         selectedRepairDirectives = () => []; getCurrentEntity = () => ({ name: 'test', key: 'test' });
@@ -345,4 +345,123 @@ test('background and forced non-user update checks perform no network requests',
     assert.equal(JSON.parse(fs.readFileSync(require('node:path').join(__dirname, '../manifest.json'), 'utf8')).auto_update, false);
     assert.ok(!source.includes('updatePollTimer'));
     assert.ok(!source.includes('setTimeout(() => void checkForPluginUpdate'));
+});
+
+test('existing general presets inherit independent API setups; character presets do not bind APIs', () => {
+    const h = harness();
+    h.run(`settings.presets = [{id:'a',kind:'general'}, {id:'b',kind:'general'}, {id:'c',kind:'character'}];
+        settings.generalPresetId = 'a'; syncPresetApiConfig(settings);`);
+    assert.equal(h.run('settings.apiConfigPresetId'), 'a');
+    assert.equal(h.run('settings.presets[0].apiConfig.dualApi.apiKey'), 'private-test-key');
+    assert.equal(h.run('settings.presets[2].apiConfig'), undefined);
+    h.run("settings.dualApi.models.push('new'); syncPresetApiConfig(settings);");
+    assert.ok(!h.run('settings.presets[1].apiConfig.dualApi.models').includes('new'));
+    assert.equal(h.run('syncPresetApiConfig(settings)'), false);
+});
+
+test('activating general presets restores mode, credentials, fallback channels, order and parameters', () => {
+    const h = harness();
+    h.run(`settings.presets = [{id:'a',kind:'general'}, {id:'b',kind:'general'}];
+        settings.generalPresetId = 'a'; syncPresetApiConfig(settings);
+        settings.dualApi.fallbacks = [{id:'fallback-a',provider:'claude',apiKey:'fallback-secret',models:['m2','m1'],enabled:true}];
+        settings.dualApi.primaryIndex = 1; settings.dualApi.timeoutSeconds = 240;
+        activateGeneralPreset(settings, settings.presets[1]);`);
+    assert.equal(h.settings.dualApi.apiKey, 'private-test-key');
+    assert.equal(h.settings.dualApi.fallbacks.length, 0);
+    h.run(`settings.mode = 'single'; settings.dualApi.apiKey = 'b-secret';
+        activateGeneralPreset(settings, settings.presets[0]);`);
+    assert.equal(h.settings.mode, 'dual_api');
+    assert.equal(h.settings.dualApi.timeoutSeconds, 240);
+    assert.equal(h.settings.dualApi.primaryIndex, 1);
+    assert.equal(h.settings.dualApi.fallbacks[0].apiKey, 'fallback-secret');
+    assert.deepEqual(Array.from(h.settings.dualApi.fallbacks[0].models), ['m2','m1']);
+    h.run('activateGeneralPreset(settings, settings.presets[1])');
+    assert.equal(h.settings.mode, 'single'); assert.equal(h.settings.dualApi.apiKey, 'b-secret');
+    // Disabling general questions and switching characters must not select a different API owner.
+    h.run(`settings.generalEnabled = false; settings.characterEnabled = true;
+        settings.presets.push({id:'c',kind:'character',apiConfig:{mode:'dual_api',dualApi:{apiKey:'wrong'}}});
+        activateGeneralPreset(settings, settings.presets[2]); syncPresetApiConfig(settings);`);
+    assert.equal(h.settings.dualApi.apiKey, 'b-secret');
+});
+
+test('deleting active preset restores the remaining preset without copying deleted credentials', () => {
+    const h = harness();
+    h.run(`settings.presets = [{id:'a',kind:'general'}, {id:'b',kind:'general'}];
+        settings.generalPresetId = 'a'; syncPresetApiConfig(settings);
+        settings.dualApi.apiKey = 'deleted-secret'; syncPresetApiConfig(settings);
+        settings.presets.shift(); settings.generalPresetId = 'b'; syncPresetApiConfig(settings);`);
+    assert.equal(h.settings.dualApi.apiKey, 'private-test-key');
+    assert.equal(h.settings.apiConfigPresetId, 'b');
+});
+
+test('import binds current local APIs and ignores supplied credentials; export contains no API data', async () => {
+    const h = harness();
+    h.run(`settings.ui = {}; settings.presets = [createPreset('existing', 'general')];
+        settings.generalPresetId = settings.presets[0].id; syncPresetApiConfig(settings);
+        markDirty = () => syncPresetApiConfig(settings);`);
+    const payload = h.run(`makePresetExportPayload({name:'imported',kind:'general',enabled:true,
+        questions:[{text:'question',type:'open',length:'standard',enabled:true}],apiConfig:{apiKey:'hidden'}})`);
+    assert.ok(!JSON.stringify(payload).includes('apiConfig'));
+    payload.preset.apiConfig = {mode:'single',dualApi:{apiKey:'foreign-secret'}};
+    h.scope.importFile = {size:500,text:async()=>JSON.stringify(payload)};
+    await h.run('importPresetFile(importFile)');
+    assert.equal(h.settings.presets.length, 2);
+    assert.equal(h.settings.presets[1].apiConfig.dualApi.apiKey, 'private-test-key');
+    assert.equal(h.settings.generalPresetId, h.settings.presets[0].id);
+    assert.ok(!JSON.stringify(h.run('makePresetExportPayload(settings.presets[1])')).includes('private-test-key'));
+});
+
+test('draft API switching is isolated and saving persists the matching owner', () => {
+    const h = harness();
+    h.run(`settings.presets = [{id:'a',kind:'general'}, {id:'b',kind:'general'}];
+        settings.generalPresetId = 'a'; syncPresetApiConfig(settings);
+        updateSaveState = () => {}; applyTheme = () => {}; saveSettings = () => {};
+        beginEditSession(); editDraft.dualApi.apiKey = 'draft-a'; markDirty();
+        activateGeneralPreset(editDraft, editDraft.presets[1]); editDraft.dualApi.apiKey = 'draft-b'; markDirty();`);
+    assert.equal(h.settings.dualApi.apiKey, 'private-test-key');
+    h.run('discardEditDraft()');
+    assert.equal(h.run('editDraft.generalPresetId'), 'a');
+    assert.equal(h.run('editDraft.dualApi.apiKey'), 'private-test-key');
+    h.run(`activateGeneralPreset(editDraft, editDraft.presets[1]); editDraft.dualApi.apiKey = 'saved-b';
+        markDirty(); commitEditDraft({notify:false});`);
+    const saved = h.context.extensionSettings.sillytavern_self_check;
+    assert.equal(saved.generalPresetId, 'b'); assert.equal(saved.apiConfigPresetId, 'b');
+    assert.equal(saved.presets[1].apiConfig.dualApi.apiKey, 'saved-b');
+});
+
+test('switching API preset invalidates pending model discovery and probe results', async () => {
+    const h = harness();
+    h.run(`settings.presets = [{id:'a',kind:'general'}, {id:'b',kind:'general'}];
+        settings.generalPresetId = 'a'; syncPresetApiConfig(settings);
+        updateDualApiModelControl = () => {}; markDirty = () => {};
+        fetchDualApiModelList = () => new Promise(resolve => { globalThis.resolveList = resolve; });`);
+    const pending = h.run('fetchDualApiModels({force:true})');
+    h.run(`providerConnectionResults.set('primary',{message:'old result'});
+        activateGeneralPreset(settings, settings.presets[1]);`);
+    h.scope.resolveList(['stale-model']); await pending;
+    assert.equal(h.run('dualApiModels.length'), 0);
+    assert.equal(h.run('providerConnectionResults.size'), 0);
+});
+
+
+test('saved preset bindings survive full normalization and reload', () => {
+    const h = harness();
+    h.run(`normalizeSettings = realNormalizeSettings;
+        const saved = normalizeSettings();
+        const first = saved.presets.find(p => p.id === saved.generalPresetId);
+        const second = createPreset('second', 'general'); saved.presets.push(second);
+        syncPresetApiConfig(saved);
+        saved.dualApi.apiKey = 'first-secret'; saved.dualApi.timeoutSeconds = 300;
+        activateGeneralPreset(saved, second);
+        saved.dualApi.apiKey = 'second-secret'; syncPresetApiConfig(saved);
+        globalThis.firstId = first.id;
+        globalThis.reloaded = JSON.parse(JSON.stringify(saved));`);
+    h.context.extensionSettings.sillytavern_self_check = h.scope.reloaded;
+    h.run(`const restored = normalizeSettings();
+        activateGeneralPreset(restored, restored.presets.find(p => p.id === firstId));
+        normalizeSettings();`);
+    const saved = h.context.extensionSettings.sillytavern_self_check;
+    assert.equal(saved.dualApi.apiKey, 'first-secret');
+    assert.equal(saved.dualApi.timeoutSeconds, 300);
+    assert.equal(saved.presets.find(p => p.name === 'second').apiConfig.dualApi.apiKey, 'second-secret');
 });

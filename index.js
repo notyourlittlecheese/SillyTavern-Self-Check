@@ -3,7 +3,7 @@ import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSi
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.16';
+const STSC_VERSION = '0.4.17';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -726,6 +726,7 @@ function normalizeSettings() {
     const persistentIds = new Set(settings.persistentInstructionIds);
     settings.pendingInstructionIds = [...new Set(settings.pendingInstructionIds.filter(id => validInstructionIds.has(id) && !persistentIds.has(id)))];
 
+    if (syncPresetApiConfig(settings)) settingsMigrated = true;
     if (settingsMigrated) context.saveSettingsDebounced?.();
     return settings;
 }
@@ -738,6 +739,65 @@ function mergeDefaults(target, defaults) {
             mergeDefaults(target[key], value);
         }
     }
+}
+
+// API bindings are local settings only; shared preset exports omit them.
+function capturePresetApiConfig(settings) {
+    return { mode: settings.mode, dualApi: clone(settings.dualApi || DEFAULT_SETTINGS.dualApi) };
+}
+
+function invalidatePresetApiRequests() {
+    dualApiModelRequestId++;
+    dualApiModels = [];
+    dualApiModelsLoading = false;
+    dualApiModelsError = '';
+    dualApiModelsSignature = '';
+    if (dualApiModelFetchTimer) clearTimeout(dualApiModelFetchTimer);
+    dualApiModelFetchTimer = null;
+    for (const timer of dualApiFallbackModelTimers.values()) clearTimeout(timer);
+    dualApiFallbackModelTimers.clear();
+    dualApiFallbackModelStates.clear();
+    providerProbeRevision++;
+    providerConnectionResults.clear();
+}
+
+function syncPresetApiConfig(settings) {
+    const generals = settings.presets.filter(preset => preset.kind === 'general');
+    const current = generals.find(preset => preset.id === settings.generalPresetId);
+    if (!current) return false;
+    let changed = false;
+    const snapshot = capturePresetApiConfig(settings);
+    // Existing and newly imported presets inherit independent copies of the current setup.
+    for (const preset of generals) {
+        if (!preset.apiConfig || !preset.apiConfig.dualApi || !['single', 'dual_api'].includes(preset.apiConfig.mode)) {
+            preset.apiConfig = clone(snapshot);
+            changed = true;
+        }
+    }
+    const previous = generals.find(preset => preset.id === settings.apiConfigPresetId);
+    if (previous && JSON.stringify(previous.apiConfig) !== JSON.stringify(snapshot)) {
+        previous.apiConfig = clone(snapshot);
+        changed = true;
+    }
+    if (settings.apiConfigPresetId !== current.id) {
+        // On first upgrade the current global configuration remains authoritative.
+        if (!settings.apiConfigPresetId) current.apiConfig = clone(snapshot);
+        settings.mode = current.apiConfig.mode;
+        settings.dualApi = clone(current.apiConfig.dualApi);
+        mergeDefaults(settings.dualApi, DEFAULT_SETTINGS.dualApi);
+        settings.apiConfigPresetId = current.id;
+        invalidatePresetApiRequests();
+        changed = true;
+    }
+    return changed;
+}
+
+function activateGeneralPreset(settings, preset) {
+    if (!preset || preset.kind !== 'general') return;
+    syncPresetApiConfig(settings);
+    settings.generalPresetId = preset.id;
+    settings.generalEnabled = true;
+    syncPresetApiConfig(settings);
 }
 
 function createPreset(name = '新自检预设', kind = 'general') {
@@ -1670,6 +1730,7 @@ function beginEditSession() {
 
 function markDirty() {
     if (!editDraft) editDraft = clone(normalizeSettings());
+    syncPresetApiConfig(editDraft);
     editDirty = true;
     updateSaveState();
 }
@@ -1678,6 +1739,7 @@ function commitEditDraft({ notify = true } = {}) {
     if (!editDraft) return;
     const context = ctx();
     if (!context?.extensionSettings) return;
+    syncPresetApiConfig(editDraft);
     context.extensionSettings[STSC_MODULE] = clone(editDraft);
     const savedSettings = normalizeSettings();
     if (!savedSettings?.enabled) {
@@ -1695,6 +1757,7 @@ function commitEditDraft({ notify = true } = {}) {
 }
 
 function discardEditDraft({ notify = false } = {}) {
+    invalidatePresetApiRequests();
     editDraft = clone(normalizeSettings());
     editDirty = false;
     applyTheme(editDraft);
@@ -3986,6 +4049,7 @@ function renderPresetsTab() {
         const generalBox = kind === 'general' ? `
             <div class="stsc-binding-box">
                 当前正在生效的通用预设：<b>${escapeHtml(activeGeneral?.name || '无')}</b>
+                <div class="stsc-muted">API 配置跟随生效的通用预设；点击“设为当前通用预设”会恢复其主渠道、备用渠道、模型顺序和运行参数。切换后请保存更改。</div>
             </div>
             <div class="stsc-toolbar">
                 <button class="menu_button" type="button" data-action="set-general-preset" ${settings.generalPresetId === preset.id ? 'disabled' : ''}>${settings.generalPresetId === preset.id ? '当前通用预设' : '设为当前通用预设'}</button>
@@ -4038,7 +4102,7 @@ function renderPresetsTab() {
                 </div>
                 <input id="stsc_preset_import_file" class="stsc-file-input" type="file" accept=".json,.stsc-preset.json,application/json" aria-label="选择要导入的自检预设文件">
             </div>
-            <div class="stsc-muted" style="margin-top:8px">导出文件只包含预设名称、类型和问题设置，不包含角色绑定、聊天记录或自检结果。导入内容会先作为未保存更改加入插件。</div>
+            <div class="stsc-muted" style="margin-top:8px">导出文件只包含预设名称、类型和问题设置，不包含 API 配置、密钥、角色绑定、聊天记录或自检结果。新建或导入的通用预设默认绑定当前 API 配置；角色预设只管理问题。</div>
             ${presetDetails}
         </div>
 
@@ -4232,6 +4296,11 @@ function renderSettingsTab() {
     const modelOptions = dualApiModelOptionsHtml(dual);
     $('#stsc_tab_settings').html(`
         ${devMigrationSettingsHtml()}
+        <div class="stsc-section">
+            <div class="stsc-section-title">API 配置绑定</div>
+            <div>当前跟随通用预设：<b>${escapeHtml(getPresetById(settings.generalPresetId, settings)?.name || '无')}</b></div>
+            <div class="stsc-muted">此处的生成模式、主渠道、备用渠道、模型顺序及双 API 参数会随当前通用预设保存。角色预设不改变 API；酒馆正文主 API 仍使用酒馆自身配置。</div>
+        </div>
         <div class="stsc-section">
             <div class="stsc-section-title">运行状态</div>
             <div class="stsc-status-lights">
@@ -4991,6 +5060,7 @@ async function importPresetFile(file) {
         const imported = validateImportedPresetPayload(payload);
         const settings = getUiSettings();
         const preset = createPreset(makeUniquePresetName(imported.name), imported.kind);
+        if (preset.kind === 'general') preset.apiConfig = capturePresetApiConfig(settings);
         preset.enabled = imported.enabled;
         preset.questions = imported.questions.map(question => ({
             id: uid('q'),
@@ -6032,6 +6102,7 @@ function bindUiEvents() {
             }
             return;
         } else if (action === 'copy-preset' && preset) {
+            syncPresetApiConfig(settings);
             const copied = clone(preset);
             copied.id = uid('preset');
             copied.name = makeUniquePresetName(`${preset.name} 副本`);
@@ -6067,8 +6138,7 @@ function bindUiEvents() {
             });
             return;
         } else if (action === 'set-general-preset' && preset?.kind === 'general') {
-            settings.generalPresetId = preset.id;
-            settings.generalEnabled = true;
+            activateGeneralPreset(settings, preset);
             toastr.success(`已将“${preset.name}”设为当前通用预设。`, '墨提斯之镜');
         } else if (action === 'bind-current-character' && preset?.kind === 'character') {
             const character = getCurrentCharacterEntity();
@@ -6349,6 +6419,7 @@ function bindUiEvents() {
                 return;
             }
             const preset = createPreset(name, kind);
+            if (kind === 'general') preset.apiConfig = capturePresetApiConfig(settings);
             settings.presets.push(preset);
             settings.ui.presetSection = kind;
             if (kind === 'character') settings.ui.editingCharacterPresetId = preset.id;
