@@ -325,7 +325,7 @@ test('manager renders every tab with populated questions and references', () => 
         initialized = true;
         renderAll();
     `, scope);
-    for (const tab of ['status','presets','references','temporary','settings','appearance','updates']) {
+    for (const tab of ['status','latest','presets','references','temporary','settings','appearance','updates']) {
         assert.ok(html.get('#stsc_tab_' + tab)?.length > 100, tab + ' must render');
     }
     assert.ok(html.get('#stsc_tab_updates').includes('尚未检查远程版本'));
@@ -570,4 +570,95 @@ test('QR creation handles unavailable native extension, unsaved presets, save fa
     await new Promise(resolve=>setImmediate(resolve));
     assert.equal(await h.run("createPresetQr(settings.presets[0].id,'next')"),false);
     resolveSave({ok:true}); assert.equal(await pending,true);
+});
+
+test('handoff fallback uses explicit field, short leading title, then original full text', () => {
+    const h=harness();
+    h.scope.q={text:'【硬事实】完整的方法论正文',handoffText:'  一句话题意  '};
+    assert.equal(h.run('getQuestionHandoffText(q)'),'一句话题意');
+    h.scope.q.handoffText='  '; assert.equal(h.run('getQuestionHandoffText(q)'),'【硬事实】');
+    h.scope.q.text='没有可靠标题的完整问题'; assert.equal(h.run('getQuestionHandoffText(q)'),h.scope.q.text);
+    assert.equal(h.run('getQuestionHandoffText({})'),'');
+});
+
+test('12 reviewer questions stay full while both handoff formats retain exact answer mapping and omit evidence', () => {
+    const h=harness();
+    h.run(`questions.splice(0, questions.length, ...Array.from({length:12},(_,i)=>({id:'stable-'+i,text:'FULL_METHODOLOGY_'+i,handoffText:'HANDOFF_'+i,enabled:true,requireEvidence:true})));
+        globalThis.rawXml='<stsc_self_check>'+questions.map((q,i)=>'<item id="q'+(i+1)+'"><answer>ANSWER_'+i+'\\nsecond line</answer><evidence>EVIDENCE_'+i+'</evidence></item>').join('')+'</stsc_self_check>';
+        globalThis.parsedCheck=parseModelOutput(rawXml,questions);`);
+    const before=h.run('buildDualApiMessages([], questions, [], [], settings)');
+    const old=h.run('buildDualApiMessages([], questions.map(({handoffText,...q})=>q), [], [], settings)');
+    assert.deepEqual(JSON.parse(JSON.stringify(before)),JSON.parse(JSON.stringify(old)));
+    for(const transform of [false,true]) {
+        h.settings.dualApi.transformFormat=transform;
+        const output=h.run('buildDualApiHandoffInjection(questions, parsedCheck, settings)');
+        assert.ok(output.includes(h.run('buildDualApiAdjudicationPrompt()')));
+        for(let i=0;i<12;i++) {
+            assert.ok(JSON.stringify(before).includes('FULL_METHODOLOGY_'+i));
+            assert.ok(output.includes('HANDOFF_'+i)); assert.ok(output.includes('ANSWER_'+i));
+            assert.ok(!output.includes('FULL_METHODOLOGY_'+i)); assert.ok(!output.includes('EVIDENCE_'+i));
+            const ui=h.run(`renderAnswerCard(parsedCheck.answers[${i}],${i})`);
+            assert.ok(ui.includes('FULL_METHODOLOGY_'+i)); assert.ok(ui.includes('EVIDENCE_'+i));
+            if(!transform) assert.ok(output.includes(`Q${i+1}：HANDOFF_${i}\nA${i+1}：ANSWER_${i}\nsecond line`));
+        }
+        h.run('questions[4].enabled=false');
+        const filtered=h.run('buildDualApiHandoffInjection(questions, parsedCheck, settings)');
+        assert.ok(!filtered.includes('HANDOFF_4')); assert.ok(filtered.includes('HANDOFF_5'));
+        h.run('questions[4].enabled=true');
+    }
+});
+
+test('live main injection and captured main request exclude full reviewer questions and evidence', async () => {
+    const h=harness();
+    h.run("questions[0].handoffText='HANDOFF_A'; questions[1].handoffText='HANDOFF_B';");
+    h.mock(()=>h.response(200,{text:h.good}));
+    await h.run("sillyTavernSelfCheckInterceptor([],0,()=>{},'normal')");
+    assert.ok(JSON.stringify(h.calls[0]).includes('first question'));
+    const text=h.run("runtimePromptTexts.get('stsc_dual_main')");
+    assert.ok(text.includes('HANDOFF_A')); assert.ok(text.includes('A2：B'));
+    assert.ok(!text.includes('first question')); assert.ok(!text.includes('A2依据'));
+    h.scope.mainText=text;
+    h.run("captureRealRequest({messages:[{role:'assistant',content:mainText}],model:'main'})");
+    assert.ok(h.run('JSON.stringify(detailedRun.mainRequest)').includes('HANDOFF_A'));
+    assert.ok(!h.run('JSON.stringify(detailedRun.mainRequest)').includes('first question'));
+});
+
+test('supplement and exhausted dual API fallback use handoff text; single mode retains full questions', async () => {
+    for(const kind of ['partial','failed','single']) {
+        const h=harness(); h.run("questions[0].handoffText='SHORT_A'; questions[1].handoffText='SHORT_B';");
+        h.mock(()=>h.response(kind==='failed'?500:200,{text:'<stsc_self_check><item id="q2"><answer>B</answer><evidence>SECRET_EVIDENCE</evidence></item></stsc_self_check>'}));
+        if(kind==='single') h.settings.mode='single';
+        await h.run("sillyTavernSelfCheckInterceptor([],0,()=>{},'normal')");
+        const text=h.run("[...runtimePromptTexts.values()].join('\\n')");
+        if(kind==='single') assert.ok(text.includes('first question'));
+        else {assert.ok(text.includes('SHORT_A')); assert.ok(!text.includes('first question')); assert.ok(!text.includes('second question')); assert.ok(!text.includes('SECRET_EVIDENCE'));}
+    }
+});
+
+test('handoff field survives normalize, clone and preset export/import without a format bump', async () => {
+    const h=harness();
+    h.run(`settings.ui={}; const preset=createPreset('handoff-test','general');
+        const q=createQuestion('FULL'); q.handoffText='SHORT'; preset.questions=[q];
+        settings.presets=[preset]; settings.generalPresetId=preset.id;
+        normalizeQuestion(q); globalThis.exported=makePresetExportPayload(clone(preset));
+        markDirty=()=>{};`);
+    assert.equal(h.scope.exported.preset.questions[0].handoffText,'SHORT');
+    h.scope.importFile={size:500,text:async()=>JSON.stringify(h.scope.exported)};
+    await h.run('importPresetFile(importFile)');
+    assert.equal(h.settings.presets[1].questions[0].handoffText,'SHORT');
+    assert.equal(h.settings.presets[1].questions[0].text,'FULL');
+    delete h.scope.exported.preset.questions[0].handoffText;
+    assert.equal(h.run('validateImportedPresetPayload(exported).questions[0].handoffText'),'');
+});
+
+test('replay test logs the same handoff builder while retaining full reviewer request and UI evidence', async () => {
+    const h=harness();
+    h.run(`questions[0].handoffText='REPLAY_A'; questions[1].handoffText='REPLAY_B';
+        latestSnapshot={chatId:'chat-a',timestamp:Date.now(),removedInjections:0,messages:[{role:'user',content:'REAL_INPUT'}]};`);
+    h.mock(()=>h.response(200,{text:h.good}));
+    await h.run('testDualApiSelfCheckOnly()');
+    assert.equal(h.run('detailedRun.status'),'test_completed');
+    assert.equal(h.run('detailedRun.mainHandoffPreview'),h.run('buildDualApiHandoffInjection(questions,parseModelOutput('+JSON.stringify(h.good)+',questions),settings)'));
+    assert.ok(JSON.stringify(h.calls[0]).includes('first question'));
+    assert.ok(h.run('lastTestResult').includes('依据：E'));
 });

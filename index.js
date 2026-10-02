@@ -3,7 +3,7 @@ import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSi
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.18';
+const STSC_VERSION = '0.4.19';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -442,8 +442,8 @@ async function exportLatestDetail() {
 }
 
 function buildSupplementPrompt(questions, parsed, missing) {
-    const known = dualApiAnswerRows(questions, parsed).filter(row => row.answer).map(row => `原题Q${row.index}：${row.question}\n已有答案：${row.answer}\n已有依据：${row.evidence || '（缺失）'}`).join('\n\n');
-    return `[墨提斯之镜｜主API补答]\n副API已结束，不再请求。保留以下已有答案，只补下面列出的缺失回答或依据。若已有答案但缺依据，沿用答案并补依据。补答题号使用下面的局部q1、q2编号，不沿用原题号。补答后在同一次回复中继续生成正文。\n\n${known}\n\n${buildSinglePrompt(missing)}`;
+    const known = dualApiHandoffRows(questions, parsed).map(row => `原题Q${row.index}：${row.question}\n已有答案：${row.answer}`).join('\n\n');
+    return `[墨提斯之镜｜主API补答]\n副API已结束，不再请求。保留以下已有答案，只补下面列出的缺失回答或依据。若已有答案但缺依据，沿用答案并补依据。补答题号使用下面的局部q1、q2编号，不沿用原题号。补答后在同一次回复中继续生成正文。\n\n${known}\n\n${buildSinglePrompt(mainHandoffQuestions(missing))}`;
 }
 
 function mergeSupplementAnswers(initial, supplement, questions, missing) {
@@ -706,7 +706,7 @@ function normalizeSettings() {
     if (initialGeneral?.name === '通用自检预设') initialGeneral.name = '默认（初始默认）';
 
     settings.ui.presetSection = settings.ui.presetSection === 'character' ? 'character' : 'general';
-    settings.ui.activeTab = ['status', 'presets', 'references', 'temporary', 'settings', 'appearance'].includes(settings.ui.activeTab) ? settings.ui.activeTab : 'status';
+    settings.ui.activeTab = ['status', 'latest', 'presets', 'references', 'temporary', 'settings', 'appearance'].includes(settings.ui.activeTab) ? settings.ui.activeTab : 'status';
     const oldEditing = settings.presets.find(x => x.id === settings.ui.editingPresetId);
     if (!settings.ui.editingGeneralPresetId && oldEditing?.kind === 'general') settings.ui.editingGeneralPresetId = oldEditing.id;
     if (!settings.ui.editingCharacterPresetId && oldEditing?.kind === 'character') settings.ui.editingCharacterPresetId = oldEditing.id;
@@ -1097,6 +1097,7 @@ function createQuestion(text = '', type = 'open', length = 'standard', requireEv
     return {
         id: uid('q'),
         text,
+        handoffText: '',
         type,
         length,
         requireEvidence,
@@ -1107,6 +1108,7 @@ function createQuestion(text = '', type = 'open', length = 'standard', requireEv
 function normalizeQuestion(question) {
     question.id ||= uid('q');
     question.text ||= '';
+    question.handoffText = typeof question.handoffText === 'string' ? question.handoffText : '';
     question.type = ['open', 'boolean'].includes(question.type) ? question.type : 'open';
     question.length = ['brief', 'standard', 'detailed'].includes(question.length) ? question.length : 'standard';
     if (question.requireEvidence === undefined) question.requireEvidence = true;
@@ -2997,6 +2999,25 @@ async function callDualApiSelfCheck(args, { candidateLimit = 0, replay = false }
     }
 }
 
+function getQuestionHandoffText(question) {
+    const handoff = typeof question?.handoffText === 'string' ? question.handoffText.trim() : '';
+    if (handoff) return handoff;
+    const text = String(question?.text || '');
+    // Only an explicit, short leading title is reliable; never guess a summary.
+    const title = text.trim().match(/^【([^【】\r\n]{1,80})】/);
+    return title && title[1].trim() ? `【${title[1].trim()}】` : text;
+}
+
+function mainHandoffQuestions(questions) {
+    return questions.map(question => ({ ...question, text: getQuestionHandoffText(question) }));
+}
+
+function dualApiHandoffRows(questions, parsed) {
+    return dualApiAnswerRows(questions, parsed)
+        .filter(row => questions[row.index - 1].enabled !== false && row.answer)
+        .map(row => ({ ...row, question: getQuestionHandoffText(questions[row.index - 1]) }));
+}
+
 function dualApiAnswerRows(questions, parsed) {
     const answerMap = new Map((parsed?.answers || []).map(answer => [answer.id, answer]));
     return questions.map((question, index) => {
@@ -3059,13 +3080,12 @@ function buildDualApiAdjudicationPrompt() {
 }
 
 function buildDualApiRawInjection(questions, parsed) {
-    const rows = dualApiAnswerRows(questions, parsed).filter(row => row.answer);
+    const rows = dualApiHandoffRows(questions, parsed);
     if (!rows.length) return '';
 
     const content = rows.map(row => [
         `Q${row.index}：${row.question}`,
         `A${row.index}：${row.answer}`,
-        row.evidence ? `A${row.index}依据：${row.evidence}` : '',
     ].filter(Boolean).join('\n')).join('\n\n');
 
     return `
@@ -3087,12 +3107,13 @@ function yamlQuoted(value) {
 }
 
 function buildDualApiContractInjection(questions, parsed) {
-    const rows = dualApiAnswerRows(questions, parsed).filter(row => row.answer);
+    const rows = dualApiHandoffRows(questions, parsed);
     if (!rows.length) return '';
 
     const rules = rows.map(row => [
-        `    - suggestion: ${yamlQuoted(row.answer)}`,
-        row.evidence ? `      claimed_basis: ${yamlQuoted(row.evidence)}` : '',
+        `    - question_id: q${row.index}`,
+        `      question: ${yamlQuoted(row.question)}`,
+        `      suggestion: ${yamlQuoted(row.answer)}`,
     ].filter(Boolean).join('\n')).join('\n');
 
     return `
@@ -3121,11 +3142,15 @@ ${rules}
 `.trim();
 }
 
-function applyDualApiMainPrompt(questions, parsed, rawCheck, settings) {
-    const transform = Boolean(settings.dualApi.transformFormat);
-    let text = transform
+function buildDualApiHandoffInjection(questions, parsed, settings) {
+    return settings.dualApi.transformFormat
         ? buildDualApiContractInjection(questions, parsed)
         : buildDualApiRawInjection(questions, parsed);
+}
+
+function applyDualApiMainPrompt(questions, parsed, rawCheck, settings) {
+    const transform = Boolean(settings.dualApi.transformFormat);
+    let text = buildDualApiHandoffInjection(questions, parsed, settings);
     const repairs = selectedRepairDirectives();
     if (repairs.length) {
         text += `\n\n<stsc_repair_directives>\n以下是用户确认需要在本轮自然修复的问题。必须承认已经发生的剧情，不得重写或生硬重置上一轮。\n${repairs.map(item => `<repair>${wrapXmlCdata(item)}</repair>`).join('\n')}\n</stsc_repair_directives>`;
@@ -3821,7 +3846,7 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
             addRuntimeLog('warning', '自检API', `${character}：${reason}`, '插件已经自动改用单API继续生成，本轮不会直接中断。');
             pendingRun.mode = 'single';
             pendingRun.questions = clone(getDualApiQuestions(settings));
-            setRuntimePrompt('stsc_main', buildSinglePrompt(pendingRun.questions), settings.injection);
+            setRuntimePrompt('stsc_main', buildSinglePrompt(mainHandoffQuestions(pendingRun.questions)), settings.injection);
             toastr.warning(`独立自检API调用失败，已自动退回单API模式。原因：${reason}`, '墨提斯之镜', { timeOut: 9000 });
         } finally {
             dualApiBusy = false;
@@ -4020,11 +4045,35 @@ function testResultSectionHtml() {
 function renderStatusTab() {
     const settings = getUiSettings();
     const summary = activeSummary(settings);
-    const latest = getLatestResult();
     const questionList = summary.questions.length
         ? summary.questions.map((q, i) => `<div class="stsc-question-card"><div class="stsc-card-title">${i + 1}. ${escapeHtml(q.text)}</div><div class="stsc-muted">${escapeHtml(q.source || '')}｜${q.type === 'boolean' ? '判断题' : '开放问答'}｜${q.length === 'brief' ? '简短' : q.length === 'detailed' ? '详细' : '标准'}${q.requireEvidence ? '｜需要依据' : ''}</div></div>`).join('')
         : '<div class="stsc-empty">当前没有生效的自检问题。</div>';
 
+    const tempPills = summary.temps.length
+        ? `<div class="stsc-selected-instructions">${summary.temps.map(instruction => `<span class="stsc-temp-pill">${escapeHtml(instruction.name)}｜${escapeHtml(instructionActivationLabel(instruction.activation))}</span>`).join('')}</div>`
+        : '<div class="stsc-muted">当前没有启用快捷指令。</div>';
+
+    $('#stsc_tab_status').html(`
+        <div class="stsc-section">
+            <div class="stsc-section-title">当前生效内容</div>
+            <button class="menu_button" type="button" data-action="view-latest-check">查看上一轮自检问答</button>
+            <div><b>角色：</b>${escapeHtml(summary.entity.name)}</div>
+            <div><b>预设：</b>${escapeHtml(summary.presetText)}</div>
+            <div><b>参考资料：</b>${summary.refs.length ? summary.refs.map(x => escapeHtml(x.name)).join('、') : '无'}</div>
+            <div><b>模式：</b>${escapeHtml(generationModeLabel(settings.mode, true))}</div>
+            <div class="stsc-section-title" style="margin-top:12px">当前启用的快捷指令</div>
+            ${tempPills}
+        </div>
+        <div class="stsc-section">
+            <div class="stsc-section-title">本轮实际生效问题（${summary.questions.length}）</div>
+            ${questionList}
+        </div>
+
+    `);
+}
+
+function renderLatestTab() {
+    const latest = getLatestResult();
     let latestHtml = '<div class="stsc-empty">还没有自检记录。</div>';
     if (latest) {
         const answers = (latest.answers || []).length
@@ -4049,29 +4098,7 @@ function renderStatusTab() {
         `;
     }
 
-    const tempPills = summary.temps.length
-        ? `<div class="stsc-selected-instructions">${summary.temps.map(instruction => `<span class="stsc-temp-pill">${escapeHtml(instruction.name)}｜${escapeHtml(instructionActivationLabel(instruction.activation))}</span>`).join('')}</div>`
-        : '<div class="stsc-muted">当前没有启用快捷指令。</div>';
-
-    $('#stsc_tab_status').html(`
-        <div class="stsc-section">
-            <div class="stsc-section-title">当前生效内容</div>
-            <div><b>角色：</b>${escapeHtml(summary.entity.name)}</div>
-            <div><b>预设：</b>${escapeHtml(summary.presetText)}</div>
-            <div><b>参考资料：</b>${summary.refs.length ? summary.refs.map(x => escapeHtml(x.name)).join('、') : '无'}</div>
-            <div><b>模式：</b>${escapeHtml(generationModeLabel(settings.mode, true))}</div>
-            <div class="stsc-section-title" style="margin-top:12px">当前启用的快捷指令</div>
-            ${tempPills}
-        </div>
-        <div class="stsc-section">
-            <div class="stsc-section-title">本轮实际生效问题（${summary.questions.length}）</div>
-            ${questionList}
-        </div>
-        <div class="stsc-section">
-            <div class="stsc-section-title">最新一轮自检</div>
-            ${latestHtml}
-        </div>
-    `);
+    $('#stsc_tab_latest').html(`<div class="stsc-section"><div class="stsc-section-title">上一轮自检（最近保存的一轮）</div>${latestHtml}</div>`);
 }
 
 function presetOptions(kind, selectedId, settings = getUiSettings()) {
@@ -4108,6 +4135,11 @@ function renderQuestionCards(preset) {
                 <div class="stsc-field">
                     <label>问题内容</label>
                     <textarea class="text_pole stsc-textarea" data-question-field="text">${escapeHtml(question.text)}</textarea>
+                </div>
+                <div class="stsc-field" style="margin-top:9px">
+                    <label>主模型交接题意（可选）</label>
+                    <textarea class="text_pole stsc-textarea" data-question-field="handoffText" placeholder="给正文主模型的一句话题意；外部自检仍读取上面的完整问题">${escapeHtml(question.handoffText || '')}</textarea>
+                    <div class="stsc-muted">留空时优先使用完整问题开头的【标题】，否则沿用完整问题。</div>
                 </div>
                 <div class="stsc-grid-3" style="margin-top:9px">
                     <div class="stsc-field">
@@ -4559,7 +4591,7 @@ function renderSettingsTab() {
                 <div class="stsc-dual-branch-grid">
                     <div class="stsc-dual-branch ${!dual.transformFormat ? 'is-active' : ''}">
                         <b>不勾选</b>
-                        <span>把问题、答案与依据原样作为 <code>Assistant role</code> 临时交给酒馆主API。</span>
+                        <span>把简短交接题意与答案（不含独立依据）作为 <code>Assistant role</code> 临时交给酒馆主API。</span>
                     </div>
                     <div class="stsc-dual-branch ${dual.transformFormat ? 'is-active' : ''}">
                         <b>勾选后</b>
@@ -4924,6 +4956,7 @@ function renderAll() {
     renderCompact();
     renderManagerSubtitle();
     renderStatusTab();
+    renderLatestTab();
     renderPresetsTab();
     renderReferencesTab();
     renderTemporaryTab();
@@ -4945,7 +4978,7 @@ function openManager(tab = null) {
     $('body').addClass('stsc-modal-open');
     performSwitchTab(settings.ui.activeTab || 'status');
     renderAll();
-    if ((settings.ui.activeTab || 'status') === 'status') void markLatestIssueViewed();
+    if (settings.ui.activeTab === 'latest') void markLatestIssueViewed();
 }
 
 function performCloseManager() {
@@ -5015,7 +5048,7 @@ function switchTab(tab) {
     requestUnsavedDecision(() => {
         performSwitchTab(tab);
         renderAll();
-        if (tab === 'status') void markLatestIssueViewed();
+        if (tab === 'latest') void markLatestIssueViewed();
     });
 }
 
@@ -5085,6 +5118,7 @@ function makePresetExportPayload(preset) {
             enabled: Boolean(preset.enabled),
             questions: preset.questions.map(question => ({
                 text: question.text,
+                handoffText: typeof question.handoffText === 'string' ? question.handoffText : '',
                 type: question.type,
                 length: question.length,
                 requireEvidence: Boolean(question.requireEvidence),
@@ -5141,6 +5175,7 @@ function validateImportedPresetPayload(payload) {
         if (typeof question.enabled !== 'boolean') throw new Error(`第 ${index + 1} 个问题的启用状态格式不正确。`);
         return {
             text,
+            handoffText: typeof question.handoffText === 'string' ? question.handoffText : '',
             type: question.type,
             length: question.length,
             requireEvidence: question.requireEvidence,
@@ -5585,7 +5620,7 @@ async function testDualApiSelfCheckOnly() {
         }, { candidateLimit: 1, replay: true });
         const parsed = parseModelOutput(result.text, questions);
         const status = dualParsedIsComplete(parsed, questions) ? 'ok' : parsed.status;
-        updateDetailedRun({ status: 'test_completed', parsed });
+        updateDetailedRun({ status: 'test_completed', parsed, mainHandoffPreview: buildDualApiHandoffInjection(questions, parsed, settings) });
         const issues = (parsed.formatIssues || []).map(plainSelfCheckIssue).filter(Boolean);
         const rawReturn = String(result.text || '').trim();
         const answers = (parsed.answers || []).map((answer, index) => [
@@ -6254,6 +6289,9 @@ function bindUiEvents() {
             return;
         } else if (action === 'create-preset-qr' && preset?.kind === 'general') {
             openPresetQrDialog(preset);
+            return;
+        } else if (action === 'view-latest-check') {
+            switchTab('latest');
             return;
         } else if (action === 'set-general-preset' && preset?.kind === 'general') {
             activateGeneralPreset(settings, preset);
