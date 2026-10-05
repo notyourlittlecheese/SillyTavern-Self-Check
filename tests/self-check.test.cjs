@@ -94,8 +94,8 @@ test('incomplete answers go to main supplement without any additional API reques
     assert.equal(h.run("runtimePromptTexts.has('stsc_supplement')"), true);
 });
 
-test('two failures fall back to main API even with old stop setting', async () => {
-    const h = harness(); h.settings.dualApi.failureMode = 'stop'; h.mock(() => h.response(500, { error: 'unavailable' }));
+test('two failures fall back to main API when takeover is selected', async () => {
+    const h = harness(); h.settings.dualApi.failureMode = 'fallback_single'; h.mock(() => h.response(500, { error: 'unavailable' }));
     await h.run("sillyTavernSelfCheckInterceptor([], 0, () => { throw Error('unexpected stop'); }, 'normal')");
     assert.equal(h.calls.length, 2); assert.equal(h.run('pendingRun.mode'), 'single');
     assert.equal(h.run("runtimePromptTexts.has('stsc_main')"), true);
@@ -239,13 +239,13 @@ test('direct generation without a new user message preserves the latest user tur
     assert.ok(h.calls[0].messages.some(message => message.role === 'user' && message.content === 'LAST_USER_INPUT'));
 });
 
-test('mixed-provider fallback uses the second channel protocol and preserves two-request limit', async () => {
+test('mixed-provider fallback uses second channel after two attempts on first channel', async () => {
     const h = harness(); h.settings.dualApi.models = ['first'];
     h.settings.dualApi.fallbacks = [{ id:'native',provider:'claude',endpoint:'https://api.anthropic.com/v1',apiKey:'native-secret',models:['claude-sonnet-4-6'] }];
-    h.mock(n => n === 1 ? h.response(401, {error:'invalid key'}) : h.response(200,{content:[{type:'text',text:h.good}]}));
+    h.mock(n => n <= 2 ? h.response(401, {error:'invalid key'}) : h.response(200,{content:[{type:'text',text:h.good}]}));
     const result = await h.call();
-    assert.equal(h.calls.length,2); assert.equal(h.calls[1].chat_completion_source,'claude');
-    assert.equal(h.calls[1].use_sysprompt,true); assert.equal(h.calls[1].proxy_password,'native-secret');
+    assert.equal(h.calls.length,3); assert.equal(h.calls[2].chat_completion_source,'claude');
+    assert.equal(h.calls[2].use_sysprompt,true); assert.equal(h.calls[2].proxy_password,'native-secret');
     assert.equal(result.text,h.good);
 });
 
@@ -661,4 +661,100 @@ test('replay test logs the same handoff builder while retaining full reviewer re
     assert.equal(h.run('detailedRun.mainHandoffPreview'),h.run('buildDualApiHandoffInjection(questions,parseModelOutput('+JSON.stringify(h.good)+',questions),settings)'));
     assert.ok(JSON.stringify(h.calls[0]).includes('first question'));
     assert.ok(h.run('lastTestResult').includes('依据：E'));
+});
+
+test('channel plan attempts models 1/2 per enabled channel, skips model 3, honors channel order', async () => {
+    const h=harness();
+    h.settings.dualApi.fallbacks=[
+        {id:'b',endpoint:'https://b.test/v1',models:['b1','b2','b3']},
+        {id:'off',endpoint:'https://off.test/v1',models:['off'],enabled:false},
+        {id:'c',endpoint:'https://c.test/v1',models:['c1']},
+    ];
+    h.settings.dualApi.primaryIndex=1;
+    h.mock(()=>h.response(503,{error:'unavailable'}));
+    await assert.rejects(h.call());
+    assert.deepEqual(h.calls.map(c=>c.model),['b1','b2','c1','c1','first','second']);
+});
+
+test('stop option aborts generation and clears all plugin injections after failures or incomplete answers', async () => {
+    for(const incomplete of [false,true]) {
+        const h=harness(); h.settings.dualApi.failureMode='stop';
+        h.settings.dualApi.fallbacks=[{id:'b',endpoint:'https://b.test/v1',models:['b1','b2']}];
+        h.mock(()=>incomplete?h.response(200,{text:'<stsc_self_check><item id="q1"><answer>A</answer></item></stsc_self_check>'}):h.response(503,{error:'down'}));
+        let aborts=0; h.scope.abortMain=()=>aborts++;
+        await h.run("sillyTavernSelfCheckInterceptor([],0,abortMain,'normal')");
+        assert.equal(aborts,1); assert.equal(h.run('pendingRun'),null);
+        assert.equal(h.run('runtimePromptTexts.size'),0);
+        assert.equal(h.run('detailedRun.decision'),'stop_generation');
+        assert.equal(h.calls.length,incomplete?1:4);
+    }
+});
+
+test('streaming resets inactivity timeout on received chunks and passes only final text to parsing', async () => {
+    const h=harness();
+    let streamController;
+    const body=new ReadableStream({start(controller){streamController=controller;}});
+    const encoder=new TextEncoder();
+    const tick=()=>new Promise(resolve=>setImmediate(resolve));
+    h.scope.fetch=async(_url,init)=>{
+        const request=JSON.parse(init.body); assert.equal(request.stream,true);
+        init.signal.addEventListener('abort',()=>streamController.error(new Error('aborted')));
+        return {ok:true,status:200,headers:{get:()=> 'text/event-stream'},body};
+    };
+    const pending=h.call(); await tick();
+    const firstId=[...h.timers.keys()][0];
+    streamController.enqueue(encoder.encode('data: {"choices":[{"delta":{"reasoning_content":"not-an-answer"}}]}\n\n')); await tick();
+    assert.ok(!h.timers.has(firstId)); assert.equal(h.timers.size,1);
+    streamController.enqueue(encoder.encode('data: '+JSON.stringify({choices:[{delta:{content:h.good}}]})+'\n\n')); await tick();
+    streamController.enqueue(encoder.encode('data: [DONE]\n\n'));
+    const result=await pending;
+    assert.equal(result.text,h.good); assert.equal(h.timers.size,0);
+});
+
+test('silent stream timeout never switches channel and obeys stop mode', async () => {
+    const h=harness(); h.settings.dualApi.failureMode='stop';
+    let streamController,aborts=0;
+    h.scope.abortMain=()=>aborts++;
+    h.scope.fetch=async(_url,init)=>{
+        const body=new ReadableStream({start(controller){streamController=controller;}});
+        init.signal.addEventListener('abort',()=>streamController.error(new Error('aborted')));
+        return {ok:true,status:200,headers:{get:()=> 'text/event-stream'},body};
+    };
+    const pending=h.run("sillyTavernSelfCheckInterceptor([],0,abortMain,'normal')");
+    await new Promise(resolve=>setImmediate(resolve));
+    [...h.timers.values()].find(t=>t.ms===120000).fn(); await pending;
+    assert.equal(aborts,1); assert.equal(h.run('detailedRun.attempts.length'),1);
+    assert.equal(h.run('runtimePromptTexts.size'),0);
+});
+
+test('per-channel budgets use configured models and cycle only within that channel', async () => {
+    const h=harness(); h.settings.dualApi.maxAttempts=3;
+    h.settings.dualApi.fallbacks=[{id:'b',endpoint:'https://b.test/v1',models:['b1','b2'],maxAttempts:4},{id:'c',endpoint:'https://c.test/v1',models:['c1'],maxAttempts:1}];
+    h.mock(()=>h.response(503,{error:'down'})); await assert.rejects(h.call());
+    assert.deepEqual(h.calls.map(c=>c.model),['first','second','third','b1','b2','b1','b2','c1']);
+    assert.equal(h.run('channelAttemptLimit({})'),2);
+    assert.equal(h.run('channelAttemptLimit({maxAttempts:99})'),10);
+    assert.equal(h.run('channelAttemptLimit({maxAttempts:0})'),1);
+    assert.equal(h.run('channelAttemptLimit({maxAttempts:"invalid"})'),2);
+});
+
+test('model reorder keeps exact membership, changes execution order, and rejects stale lists', () => {
+    const h=harness();
+    assert.equal(h.run("applySelectedModelOrder(settings.dualApi,['third','first','second'])"),true);
+    assert.deepEqual(Array.from(h.run('channelPlannedModels(settings.dualApi)')),['third','first']);
+    assert.equal(h.run("applySelectedModelOrder(settings.dualApi,['third','first','first'])"),false);
+    assert.equal(h.run("applySelectedModelOrder(settings.dualApi,['unknown','first','second'])"),false);
+});
+
+test('attempt budgets survive normalization and preset switching without sharing configurations', () => {
+    const h=harness();
+    h.run(`normalizeSettings=realNormalizeSettings;
+        const current=normalizeSettings();
+        current.dualApi.maxAttempts=4;
+        current.dualApi.fallbacks=[{id:'b',endpoint:'https://b.test/v1',models:['b1'],maxAttempts:7}];
+        const next=createPreset('next'); current.presets.push(next); syncPresetApiConfig(current);
+        activateGeneralPreset(current,next); current.dualApi.maxAttempts=1; current.dualApi.fallbacks[0].maxAttempts=2;
+        normalizeSettings(); activateGeneralPreset(current,current.presets[0]); normalizeSettings();`);
+    assert.equal(h.settings.dualApi.maxAttempts,4);
+    assert.equal(h.settings.dualApi.fallbacks[0].maxAttempts,7);
 });

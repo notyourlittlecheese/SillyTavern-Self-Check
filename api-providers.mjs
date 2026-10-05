@@ -238,3 +238,78 @@ export async function testConnection(config, options = {}) {
     readGenerationText(payload);
     return true;
 }
+
+// ST forwards provider SSE frames unchanged. Only final text deltas become answers.
+export async function readSelfCheckStream(response, { signal, onActivity = () => {}, onProgress = () => {} } = {}) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '', raw = '', text = '', finished = false, terminal = false;
+    const fail = (message, explicit = false) => {
+        const error = new Error(message);
+        error.code = explicit ? 'provider_failure' : 'stream_interrupted';
+        error.explicitFailure = explicit;
+        return error;
+    };
+    const processFrame = frame => {
+        const data = frame.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).replace(/^ /, '')).join('\n');
+        if (!data) return;
+        if (data.trim() === '[DONE]') { finished = true; return; }
+        let payload;
+        try { payload = JSON.parse(data); } catch { throw fail('自检流式数据格式异常；不自动重发。'); }
+        if (payload.error || payload.type === 'error') {
+            const error = providerError(Number(payload.error?.code) || 500, payload);
+            const uncertain = /timeout|timed out|ECONNRESET|超时/i.test(JSON.stringify(payload.error || payload));
+            error.code = uncertain ? 'timeout' : 'provider_failure';
+            error.explicitFailure = !uncertain;
+            throw error;
+        }
+        const candidate = payload.candidates?.[0];
+        if (payload.promptFeedback?.blockReason || ['SAFETY','RECITATION','PROHIBITED_CONTENT'].includes(candidate?.finishReason)
+            || payload.choices?.[0]?.finish_reason === 'content_filter') throw fail('供应商未返回可用文本；请检查内容限制或渠道配置。', true);
+        let delta = '';
+        if (payload.type === 'content_block_delta' && payload.delta?.type === 'text_delta') delta = payload.delta.text || '';
+        else if (payload.type === 'content_block_start' && payload.content_block?.type === 'text') delta = payload.content_block.text || '';
+        else if (candidate) delta = (candidate.content?.parts || []).filter(part => !part.thought && typeof part.text === 'string').map(part => part.text).join('');
+        else {
+            const choice = payload.choices?.find(choice => !choice.index) || payload.choices?.[0];
+            const content = choice?.delta?.content ?? choice?.message?.content ?? choice?.text;
+            delta = typeof content === 'string' ? content : Array.isArray(content)
+                ? content.filter(part => !part.thought && ['text','output_text'].includes(part.type)).map(part => part.text || '').join('') : '';
+        }
+        text += delta;
+        onProgress({ textLength: text.length });
+        if (payload.type === 'message_stop') finished = true;
+        if (candidate?.finishReason || payload.choices?.some(choice => !choice.index && choice.finish_reason)) terminal = true;
+    };
+    try {
+        while (!finished) {
+            const part = await reader.read();
+            if (signal?.aborted) throw fail('流式请求已停止。');
+            if (part.done) break;
+            if (part.value.byteLength) onActivity();
+            const chunk = decoder.decode(part.value, {stream:true});
+            raw += chunk;
+            // Handle both LF and CRLF, including a CRLF split between network chunks.
+            buffer += chunk;
+            buffer = buffer.replace(/\r\n/g, '\n');
+            let boundary;
+            while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+                const frame = buffer.slice(0, boundary); buffer = buffer.slice(boundary + 2);
+                processFrame(frame);
+                if (finished) break;
+            }
+        }
+        buffer += decoder.decode();
+        if (!finished && buffer.trim()) processFrame(buffer);
+        if (!finished && !terminal) throw fail('自检流式连接提前结束，未收到完成标记；不自动重发。');
+        if (!text.trim()) throw fail('自检API已结束，但没有返回最终文本。', true);
+        return { text, rawResponse: raw };
+    } catch (error) {
+        error.partialText = text;
+        error.rawResponse = raw;
+        throw error;
+    } finally {
+        try { await reader.cancel(); } catch { /* connection may already be closed */ }
+        reader.releaseLock();
+    }
+}

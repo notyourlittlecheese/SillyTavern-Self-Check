@@ -172,3 +172,52 @@ test('transport rejects upstream JSON errors, preserves AbortError and supports 
     controller.abort();
     await assert.rejects(pending, { name: 'AbortError' });
 });
+
+async function streamFixture(frames, { bytewise = false } = {}) {
+    const { readSelfCheckStream } = await import('../api-providers.mjs');
+    const bytes = new TextEncoder().encode(frames);
+    let offset=0;
+    const body=new ReadableStream({pull(controller){
+        if(offset>=bytes.length) {controller.close();return;}
+        const end=bytewise?offset+1:bytes.length;
+        controller.enqueue(bytes.slice(offset,end)); offset=end;
+    }});
+    return readSelfCheckStream({body});
+}
+
+test('SSE parser preserves split UTF-8 and whitespace, excludes thoughts in all supported protocols', async () => {
+    const cases=[
+        [
+            {choices:[{delta:{reasoning_content:'hidden'}}]},
+            {choices:[{delta:{content:'答案 '}}]},
+            {choices:[{delta:{content:'\n第二行'}}]},
+        ],
+        [
+            {type:'content_block_delta',delta:{type:'thinking_delta',thinking:'hidden'}},
+            {type:'content_block_delta',delta:{type:'text_delta',text:'答案 \n第二行'}},
+        ],
+        [
+            {candidates:[{content:{parts:[{thought:true,text:'hidden'}]}}]},
+            {candidates:[{content:{parts:[{text:'答案 '},{text:'\n第二行'}]},finishReason:'STOP'}]},
+        ],
+    ];
+    for(const events of cases) {
+        const wire=events.map(e=>'data: '+JSON.stringify(e)+'\r\n\r\n').join('')+'data: [DONE]\r\n\r\n';
+        const result=await streamFixture(wire,{bytewise:true});
+        assert.equal(result.text,'答案 \n第二行');
+        assert.equal(result.rawResponse,wire);
+    }
+});
+
+test('SSE parser distinguishes explicit errors from uncertain disconnects and timeouts', async () => {
+    await assert.rejects(streamFixture('data: {"error":{"message":"overloaded"}}\n\n'),e=>e.explicitFailure===true);
+    await assert.rejects(streamFixture('data: {"error":{"message":"upstream timeout"}}\n\n'),e=>e.code==='timeout' && !e.explicitFailure);
+    await assert.rejects(streamFixture('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'),e=>e.code==='stream_interrupted' && !e.explicitFailure && e.partialText==='partial');
+    await assert.rejects(streamFixture('data: not-json\n\n'),e=>!e.explicitFailure);
+    await assert.rejects(streamFixture('data: [DONE]\n\n'),e=>e.explicitFailure===true);
+});
+
+test('native completion markers finish Gemini and Claude streams without OpenAI DONE', async () => {
+    assert.equal((await streamFixture('data: {"candidates":[{"content":{"parts":[{"text":"G"}]},"finishReason":"STOP"}]}\n\n')).text,'G');
+    assert.equal((await streamFixture('data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"C"}}\n\ndata: {"type":"message_stop"}\n\n')).text,'C');
+});

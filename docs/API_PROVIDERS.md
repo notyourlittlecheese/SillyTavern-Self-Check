@@ -1,4 +1,4 @@
-> 本文主体保留原作者 v0.4.2 的设计记录。当前 fork v0.4.15 接入该适配层，但重试策略以本仓库 README 为准：每轮最多两次，超时不重试，缺题交主API。主备渠道都支持供应商选择及多模型，原版的单模型UI和精简重试测试结果不代表本分支。
+> 本文主体保留原作者 v0.4.2 的设计记录。当前 fork v0.4.21 支持流式自检及每渠道独立次数（默认2、可设1～10），超时和断流不重试；失败处理可选停止或主模型接管。以本仓库 README 为准，下面的原版实现说明不代表本分支现状。
 > 本分支额外兼容新酒馆 `use_sysprompt` 字段；后端合同测试桩补充了新版酒馆依赖。当前合并版测试结果见合并说明，不使用下面原作者的60项数字代替。
 
 # 自检 API 供应商适配设计（正式版 v0.4.2）
@@ -35,7 +35,7 @@
 - Claude 使用酒馆原生源，由酒馆转成 system/messages、max_tokens，并加 `x-api-key` 与 `anthropic-version: 2023-06-01`。适配层优先读取保留的原生 content 文本块，跳过 thinking/tool_use。
 - Gemini 使用酒馆原生源，由酒馆转成 systemInstruction、contents、user/model、generationConfig，并选择 generateContent。输入可带 models/ 前缀，发送前移除。读取候选最终文本，排除 thought。
 - 模型列表借用酒馆 custom status 路由，Claude 使用 x-api-key，Gemini 使用 x-goog-api-key，并覆盖 Authorization 为空，避免借用主接口保存的密钥。
-- 所有独立自检固定非流式；不新增 SSE 解析。主 API 正文流式生成未改。
+- 原版独立自检固定非流式；本分支已支持可选 SSE 接收与连续无数据超时。主 API 正文流式生成未改。
 - 不把 reasoning_content 或 thinking 当作答案。没有最终文本时返回简短错误，交给已有重试／回退逻辑。
 
 ## 配置、安全与容错

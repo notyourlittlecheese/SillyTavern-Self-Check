@@ -2625,3 +2625,20 @@ body.stsc-modal-open {
         flex-direction: column;
     }
 }
+
+/* Channel cards and touch-friendly ordered model lists. */
+.stsc-channel-summary { cursor: pointer; padding: 12px; display: grid; gap: 5px; border-radius: 8px; background: var(--stsc-soft); }
+.stsc-channel-summary::before { content: '▸ 展开配置'; font-size: .8rem; opacity: .7; }
+.stsc-fallback-api-card[open] > .stsc-channel-summary::before { content: '▾ 收起配置'; }
+.stsc-channel-summary-title { font-weight: 600; }
+.stsc-channel-summary-model { overflow-wrap: anywhere; font-size: .85rem; }
+.stsc-channel-body { padding: 12px 4px 4px; }
+.stsc-channel-fields { display: grid; grid-template-columns: 1fr; gap: 14px; margin-top: 14px; }
+.stsc-channel-body .stsc-model-choice-list { max-height: 170px; overflow-y: auto; }
+.stsc-selected-models[data-model-sort-list] { display: flex; flex-direction: column; align-items: stretch; }
+.stsc-selected-models[data-model-sort-list] .stsc-model-pill { display: flex; border-radius: 8px; padding: 5px; gap: 6px; }
+.stsc-model-name { flex: 1; }
+.stsc-model-drag-handle { touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; cursor: grab; min-width: 40px; min-height: 40px; color: inherit; background: transparent; border: 1px solid var(--stsc-border); border-radius: 6px; font-size: 1.3rem; }
+.stsc-model-pill.is-dragging { outline: 2px solid currentColor; opacity: .8; }
+.stsc-model-pill.is-dragging .stsc-model-drag-handle { cursor: grabbing; }
+.stsc-selected-models[data-model-sort-list] .stsc-model-order-button { min-width: 34px; min-height: 36px; border-radius: 6px; }
