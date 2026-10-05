@@ -758,3 +758,32 @@ test('attempt budgets survive normalization and preset switching without sharing
     assert.equal(h.settings.dualApi.maxAttempts,4);
     assert.equal(h.settings.dualApi.fallbacks[0].maxAttempts,7);
 });
+
+
+test('custom channel names reach candidate results and defaults stay compatible', async () => {
+    const h = harness();
+    h.settings.dualApi.name = ' 常用站 ';
+    h.settings.dualApi.maxAttempts = 1;
+    h.settings.dualApi.fallbacks = [{id:'b',name:'备用直连',endpoint:'https://b.test/v1',models:['b1']}];
+    assert.equal(h.run('getDualApiCandidates(settings.dualApi)[0].apiName'), '常用站');
+    h.mock(n => n === 1 ? h.response(503,{error:'down'}) : h.response(200,{text:h.good}));
+    const result = await h.call();
+    assert.equal(result.apiName, '备用直连');
+    assert.equal(h.run('channelDisplayName({})'), '主API配置');
+    assert.equal(h.run("channelDisplayName({name:'  '},2)"), '备用API 2');
+});
+
+test('channel names survive normalization and independent general preset switching', () => {
+    const h = harness();
+    h.run(`normalizeSettings=realNormalizeSettings;
+        const current=normalizeSettings();
+        current.dualApi.name=' 常用站 ';
+        current.dualApi.fallbacks=[{id:'b',name:' 备用直连 ',endpoint:'https://b.test/v1',models:['b1']}];
+        normalizeSettings();
+        const next=createPreset('next'); current.presets.push(next); syncPresetApiConfig(current);
+        activateGeneralPreset(current,next);
+        current.dualApi.name='另一套主站'; current.dualApi.fallbacks[0].name='另一套备用站';
+        normalizeSettings(); activateGeneralPreset(current,current.presets[0]); normalizeSettings();`);
+    assert.equal(h.settings.dualApi.name,'常用站');
+    assert.equal(h.settings.dualApi.fallbacks[0].name,'备用直连');
+});

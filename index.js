@@ -3,7 +3,7 @@ import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSi
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.21';
+const STSC_VERSION = '0.4.22';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -40,12 +40,10 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-10-05',
-    title: '独立渠道次数与模型拖动排序',
+    title: '渠道自定义名称与简洁手柄',
     changes: Object.freeze([
-        "每个自检渠道独立设置最多尝试次数，范围1～10、默认2；按模型顺序尝试，次数超过模型数量时从头轮换。",
-        "备用渠道改为可折叠卡片，收起显示供应商、启用状态、首选模型和次数，新渠道自动展开。",
-        "已选模型改为纵向列表，支持触屏长按手柄拖动及鼠标拖动，保留上下箭头；顺序与API配置随预设保存。",
-        "执行顺序预览反映各渠道实际尝试次数；保留流式等待、失败停止或主模型接管选项。",
+        "主渠道与备用渠道支持自定义名称，随通用预设保存，并显示在渠道卡片、执行顺序和日志中。",
+        "模型拖动手柄改为单个上下箭头，保留长按拖动排序。"
     ]),
 });
 
@@ -536,6 +534,7 @@ function normalizeSettings() {
     if (settings.mode === 'strict') settings.mode = 'single';
     settings.mode = ['single', 'dual_api'].includes(settings.mode) ? settings.mode : 'single';
     if (!settings.dualApi || typeof settings.dualApi !== 'object') settings.dualApi = clone(DEFAULT_SETTINGS.dualApi);
+    settings.dualApi.name = String(settings.dualApi.name || '').trim();
     settings.dualApi.provider = providerId(settings.dualApi.provider);
     settings.dualApi.endpoint = String(settings.dualApi.endpoint || '');
     settings.dualApi.apiKey = String(settings.dualApi.apiKey || '');
@@ -556,6 +555,7 @@ function normalizeSettings() {
                 : [];
             return {
                 id: String(item.id || uid('api')),
+                name: String(item.name || '').trim(),
                 provider: providerId(item.provider),
                 endpoint: String(item.endpoint || ''),
                 apiKey: String(item.apiKey || ''),
@@ -1263,6 +1263,8 @@ function providerControlsHtml(config, key) {
     const result = providerConnectionResults.get(key);
     const current = result?.signature === providerProbeSignature(config) ? result : null;
     return `<div class="stsc-field" style="margin-top:10px">
+        <label>渠道名称（可选）</label>
+        <input class="text_pole" type="text" data-stsc-channel-name="${escapeHtml(key)}" value="${escapeHtml(config.name || '')}" placeholder="例如：常用中转站、备用直连">
         <label>供应商</label>
         <select class="text_pole" data-stsc-provider="${escapeHtml(key)}">${Object.entries(API_PROVIDERS).map(([id, item]) => `<option value="${id}" ${providerId(config.provider) === id ? 'selected' : ''}>${escapeHtml(item.name)}</option>`).join('')}</select>
         <details class="stsc-provider-help"><summary>接口填写说明</summary><div class="stsc-muted">${escapeHtml(getProvider(config).hint)} 切换供应商会清空此渠道的密钥和已选模型，不自动连接。</div></details>
@@ -1317,6 +1319,12 @@ async function testProviderChannel(key) {
 
 function bindProviderControls() {
     const overlay = $('#stsc_manager_overlay');
+    overlay.on('change', '[data-stsc-channel-name]', function () {
+        const config = providerConfigForKey(this.dataset.stscChannelName);
+        if (!config) return;
+        config.name = this.value.trim();
+        markDirty(); renderSettingsTab(); updateSaveState();
+    });
     overlay.on('change', '[data-stsc-attempts]', function () {
         const config = providerConfigForKey(this.dataset.stscAttempts);
         if (!config) return;
@@ -1535,7 +1543,7 @@ function dualApiSelectedModelsHtml(config) {
             <span class="stsc-muted">模型顺序 · 长按手柄拖动，或用箭头调整</span>
             ${models.map((model, index) => `
                 <span class="stsc-model-pill" data-model-row="${escapeHtml(model)}">
-                    <button class="stsc-model-drag-handle" type="button" data-model-drag title="长按拖动排序" aria-label="长按拖动 ${escapeHtml(model)}">⠿</button>
+                    <button class="stsc-model-drag-handle" type="button" data-model-drag title="长按拖动排序" aria-label="长按拖动 ${escapeHtml(model)}">↕</button>
                     <span class="stsc-model-name">${index + 1}. ${escapeHtml(model)}</span>
                     <button class="stsc-model-order-button" type="button" data-action="move-selected-model" data-model="${escapeHtml(model)}" data-direction="-1" title="上移" aria-label="上移" ${index === 0 ? 'disabled' : ''}>↑</button>
                     <button class="stsc-model-order-button" type="button" data-action="move-selected-model" data-model="${escapeHtml(model)}" data-direction="1" title="下移" aria-label="下移" ${index === models.length - 1 ? 'disabled' : ''}>↓</button>
@@ -1617,13 +1625,13 @@ function dualApiFallbacksHtml(dual) {
     return fallbacks.map((item, index) => `
         <details class="stsc-fallback-api-card" data-fallback-index="${index}" data-channel-id="${escapeHtml(item.id)}" ${expandedApiChannelIds.has(item.id) ? 'open' : ''}>
             <summary class="stsc-channel-summary">
-                <span class="stsc-channel-summary-title">${item.enabled !== false ? '●' : '○'} 备用API ${index + 1}${Number(dual.primaryIndex) === index + 1 ? ' · 主渠道' : ''}</span>
+                <span class="stsc-channel-summary-title">${item.enabled !== false ? '●' : '○'} ${escapeHtml(channelDisplayName(item, index + 1))}${Number(dual.primaryIndex) === index + 1 ? ' · 主渠道' : ''}</span>
                 <span class="stsc-muted">${escapeHtml(getProvider(item).name)} · ${channelAttemptLimit(item)} 次 · ${item.enabled !== false ? '已启用' : '已停用'}</span>
                 <span class="stsc-channel-summary-model">${escapeHtml(selectedDualApiModels(item)[0] || '未选择模型')}</span>
             </summary>
             <div class="stsc-channel-body">
             <div class="stsc-fallback-api-head">
-                <label class="checkbox_label"><input type="checkbox" data-dual-fallback-field="enabled" ${item.enabled !== false ? 'checked' : ''}> 启用备用API ${index + 1}</label>
+                <label class="checkbox_label"><input type="checkbox" data-dual-fallback-field="enabled" ${item.enabled !== false ? 'checked' : ''}> 启用 ${escapeHtml(channelDisplayName(item, index + 1))}</label>
                 <div class="stsc-compact-row">
                     <button class="menu_button stsc-small-button stsc-icon-action" type="button" data-action="move-dual-fallback-up" title="上移" aria-label="上移" ${index === 0 ? 'disabled' : ''}><i class="fa-solid fa-arrow-up"></i><span class="stsc-action-label">上移</span></button>
                     <button class="menu_button stsc-small-button stsc-icon-action" type="button" data-action="move-dual-fallback-down" title="下移" aria-label="下移" ${index === fallbacks.length - 1 ? 'disabled' : ''}><i class="fa-solid fa-arrow-down"></i><span class="stsc-action-label">下移</span></button>
@@ -2968,10 +2976,14 @@ function dualApiProviderErrorText(payload, responseText = '') {
     return compactPromptText(candidate);
 }
 
+function channelDisplayName(config, index = 0) {
+    return String(config?.name || '').trim() || (index === 0 ? '主API配置' : `备用API ${index}`);
+}
+
 function dualApiChannelConfigs(dual) {
     const channels = [{
         channelIndex: 0,
-        label: '主API配置',
+        label: channelDisplayName(dual),
         provider: providerId(dual.provider),
         endpoint: dual.endpoint,
         apiKey: dual.apiKey,
@@ -2988,7 +3000,7 @@ function dualApiChannelConfigs(dual) {
             channelIndex: index + 1,
             maxAttempts: channelAttemptLimit(item),
             provider: providerId(item.provider),
-            label: `备用API ${index + 1}`,
+            label: channelDisplayName(item, index + 1),
             endpoint: item.endpoint,
             apiKey: item.apiKey,
             model: item.model,
