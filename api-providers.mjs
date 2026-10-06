@@ -319,7 +319,7 @@ export async function readSelfCheckStream(response, { signal, onActivity = () =>
 export async function readSelfCheckResponse(response, options = {}) {
     if (!response.body?.getReader) {
         const rawResponse = await response.text();
-        if (!/^\s*(?:data:|event:|:)/.test(rawResponse)) return { transport: 'json', rawResponse };
+        if (!/^\s*(?:data:|event:|id:|retry:|:)/.test(rawResponse)) return { transport: 'json', rawResponse };
         const bytes = new TextEncoder().encode(rawResponse);
         let consumed = false;
         const reader = { read: async () => consumed ? { done: true } : (consumed = true, { value: bytes, done: false }), cancel: async () => {}, releaseLock() {} };
@@ -336,9 +336,9 @@ export async function readSelfCheckResponse(response, options = {}) {
             chunks.push(part.value);
             if (part.value.byteLength) options.onActivity?.();
             prefix += decoder.decode(part.value, { stream: true });
-            if (/^\s*(?:data:|event:|:|[\[{])/.test(prefix) || prefix.includes('\n')) break;
+            if (/^\s*(?:data:|event:|id:|retry:|:|[\[{])/.test(prefix) || (prefix.trim() && prefix.trimStart().includes('\n'))) break;
         }
-        if (/^\s*(?:data:|event:|:)/.test(prefix)) {
+        if (/^\s*(?:data:|event:|id:|retry:|:)/.test(prefix)) {
             const replay = { read: async () => chunks.length ? { value: chunks.shift(), done: false } : ended ? { done: true } : reader.read(), cancel: reason => reader.cancel(reason), releaseLock() {} };
             return { transport: 'stream', ...await readSelfCheckStream({ body: { getReader: () => replay } }, options) };
         }
@@ -358,3 +358,5 @@ export async function readSelfCheckResponse(response, options = {}) {
         reader.releaseLock();
     }
 }
+
+export const SELF_CHECK_PARSER_VERSION = "sse-sniff-2";

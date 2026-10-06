@@ -882,3 +882,32 @@ test('completed empty SSE retries next model but interrupted SSE never retries',
         else {await assert.rejects(h.call());assert.equal(calls,1);}
     }
 });
+
+
+test('leading blank SSE chunks and id fields do not force JSON fallback', async () => {
+    const h=harness(); let calls=0;
+    const raw='\n\nid: example\n\ndata: '+JSON.stringify({choices:[{delta:{content:h.good}}]})+'\n\ndata: [DONE]\n\n';
+    const bytes=new TextEncoder().encode(raw);
+    h.scope.fetch=async()=>{calls++;return new Response(new ReadableStream({start(c){for(const byte of bytes)c.enqueue(Uint8Array.of(byte));c.close();}}),{headers:{'content-type':'text/plain'}});};
+    assert.equal((await h.call()).text,h.good); assert.equal(calls,1);
+});
+
+test('copy diagnosis distinguishes live and run versions, redacts keys and omits request prompt', async () => {
+    const h=harness();
+    h.scope.detail={version:'old-version',status:'failed',attempts:[{label:'test',request:{model:'m',stream:true,messages:[{content:'PRIVATE_PROMPT'}]},error:'private-test-key',rawResponse:'data: [DONE]',transport:'json'}]};
+    const text=h.run('formatDiagnosticForCopy(detail)'); const parsed=JSON.parse(text);
+    assert.equal(parsed.runVersion,'old-version'); assert.equal(parsed.currentParserVersion,'sse-sniff-2');
+    assert.ok(!text.includes('PRIVATE_PROMPT')); assert.ok(!text.includes('private-test-key'));
+    assert.equal(parsed.attempts[0].model,'m'); assert.equal(parsed.attempts[0].rawResponse,'data: [DONE]');
+    let copied='';h.scope.navigator={clipboard:{writeText:async value=>{copied=value;}}};
+    h.run('viewedDiagnosticText=formatDiagnosticForCopy(detail)'); await h.run('copyDiagnostic()');
+    assert.equal(copied,text);
+});
+
+test('clipboard denial falls back to legacy copy and removes temporary textarea', async () => {
+    const h=harness(); let removed=false,selected=false;
+    h.scope.navigator={clipboard:{writeText:async()=>{throw Error('denied');}}};
+    h.scope.document={createElement:()=>({style:{},setAttribute(){},select(){selected=true;},remove(){removed=true;}}),body:{appendChild(){}},execCommand:()=>true};
+    await h.run("copyTextToClipboard('diagnosis')");
+    assert.equal(selected,true);assert.equal(removed,true);
+});

@@ -1,9 +1,9 @@
-import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider, buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText, readGenerationText, providerError, requestProvider, testConnection, readSelfCheckStream, readSelfCheckResponse } from './api-providers.mjs';
+import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider, buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText, readGenerationText, providerError, requestProvider, testConnection, readSelfCheckStream, readSelfCheckResponse, SELF_CHECK_PARSER_VERSION } from './api-providers.mjs?v=0.4.26';
 
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.25';
+const STSC_VERSION = '0.4.26';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 10;
@@ -40,10 +40,11 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-10-06',
-    title: '修复流式自检返回误判',
+    title: '一键复制诊断与流式识别补充修复',
     changes: Object.freeze([
-        "按实际响应内容识别流式自检，兼容中转站把SSE误标为JSON或普通文本，避免有答案却误报0题。",
-        "保留正常结束但无答案时切换下一候选、断流不重发的行为，并增加回归测试。",
+        "运行日志新增复制最新诊断，调用详情新增一键复制诊断；附带当前与记录版本、解析器版本、模型、报错和返回片段，隐藏密钥并省略完整请求上下文。",
+        "复制受限时尝试兼容复制，仍失败则提供可手动选择的诊断文本。",
+        "修复SSE前导空行与id/retry字段识别，并为解析模块添加版本参数避免旧缓存。",
     ]),
 });
 
@@ -431,7 +432,7 @@ function redactDetail(value) {
 }
 
 function beginDetailedRun(kind) {
-    detailedRun = { version: STSC_VERSION, id: uid('run'), kind, chatId: getCurrentChatId(), startedAt: Date.now(), status: 'running', attempts: [] };
+    detailedRun = { version: STSC_VERSION, parserVersion: SELF_CHECK_PARSER_VERSION, id: uid('run'), kind, chatId: getCurrentChatId(), startedAt: Date.now(), status: 'running', attempts: [] };
     persistDetailedRun();
 }
 
@@ -3143,6 +3144,7 @@ async function callDualApiCandidate(candidate, { chat, questions, references, te
             signal: controller.signal, body: JSON.stringify(body),
         });
         attempt.httpStatus = response.status;
+        attempt.responseContentType = response.headers?.get?.('content-type') || '';
         const result = await readSelfCheckResponse(response, {
             signal: controller.signal,
             onActivity: () => { resetIdleTimeout(); attempt.lastActivityAt = Date.now(); },
@@ -4253,8 +4255,7 @@ async function copyTextToClipboard(text) {
     const value = String(text || '');
     if (!value.trim()) throw new Error('没有可复制的内容。');
     if (globalThis.navigator?.clipboard?.writeText) {
-        await globalThis.navigator.clipboard.writeText(value);
-        return;
+        try { await globalThis.navigator.clipboard.writeText(value); return; } catch { /* Try legacy copy in mobile WebViews. */ }
     }
     const textarea = document.createElement('textarea');
     textarea.value = value;
@@ -5126,7 +5127,7 @@ function openLogDialog() {
     renderLogBadge();
     const list = settings.logs.length ? settings.logs.map(runtimeLogHtml).join('') : '<div class="stsc-empty">还没有运行记录。完成一次角色回复或手动检查更新后，这里会显示结果。</div>';
     openDialog('运行日志', `<div class="stsc-log-summary">成功、部分完成和失败都会记录。日志会写明时间、角色卡、运行模式、完成题数、正文与API情况；运行日志和调用详情各保留最近 ${runtimeRecordLimit(settings)} 条／轮，超出自动删除最旧记录。详情存于当前浏览器，包含请求与输出，密钥会隐藏。旧日志若未保存详情则无法补回。预设、资料和API配置不受此限制。${escapeHtml(diagnosticStorageError)}</div><div class="stsc-field"><label>运行记录保留上限（每类，1～500，默认10）</label><input id="stsc_record_limit" class="text_pole" type="number" min="1" max="500" step="1" value="${runtimeRecordLimit(settings)}"><button class="menu_button" type="button" data-dialog-action="apply-record-limit">保存上限并清理超出记录</button></div><div class="stsc-log-list">${list}</div>`,
-        '<button class="menu_button" type="button" data-dialog-action="recent-run-details">最近调用详情</button><button class="menu_button" type="button" data-dialog-action="clear-runtime-cache">清理缓存</button><button class="menu_button" type="button" data-dialog-action="export-logs">导出日志</button><button class="menu_button" type="button" data-dialog-action="export-latest-detail">导出最新调用详情</button><button class="menu_button stsc-danger-button" type="button" data-dialog-action="ask-clear-logs">清除日志</button>');
+        '<button class="menu_button" type="button" data-dialog-action="copy-latest-diagnostic">复制最新诊断</button><button class="menu_button" type="button" data-dialog-action="recent-run-details">最近调用详情</button><button class="menu_button" type="button" data-dialog-action="clear-runtime-cache">清理缓存</button><button class="menu_button" type="button" data-dialog-action="export-logs">导出日志</button><button class="menu_button" type="button" data-dialog-action="export-latest-detail">导出最新调用详情</button><button class="menu_button stsc-danger-button" type="button" data-dialog-action="ask-clear-logs">清除日志</button>');
 }
 
 function runDetailHtml(detail) {
@@ -5143,11 +5144,51 @@ function runDetailHtml(detail) {
         <details><summary>本轮完整诊断数据</summary>${pre(detail)}</details>`;
 }
 
+let viewedDiagnosticText = '';
+
+function formatDiagnosticForCopy(detail, log = null) {
+    const excerpt = value => {
+        const text = String(value || '');
+        return text.length <= 12000 ? text : `${text.slice(0, 6000)}\n…（中段省略，完整内容可导出）…\n${text.slice(-6000)}`;
+    };
+    return JSON.stringify(redactDetail({
+        currentPluginVersion: STSC_VERSION, currentParserVersion: SELF_CHECK_PARSER_VERSION,
+        runVersion: detail?.version, runParserVersion: detail?.parserVersion || '旧记录未标记',
+        runId: detail?.id, startedAt: detail?.startedAt, status: detail?.status,
+        decision: detail?.decision, error: detail?.error, missingQuestionIds: detail?.missingQuestionIds,
+        log, storageWarning: diagnosticStorageError,
+        attempts: detail?.attempts?.map(attempt => ({
+            label: attempt.label, model: attempt.request?.model, requestedStream: attempt.request?.stream,
+            status: attempt.status, httpStatus: attempt.httpStatus, responseContentType: attempt.responseContentType,
+            transport: attempt.transport, elapsedMs: attempt.elapsedMs, error: attempt.error,
+            formatIssues: attempt.parsed?.formatIssues,
+            answers: attempt.parsed?.answers?.map(answer => ({ id: answer.id, hasAnswer: Boolean(answer.answer?.trim()), hasEvidence: Boolean(answer.evidence?.trim()), requireEvidence: answer.requireEvidence })),
+            rawResponse: excerpt(attempt.rawResponse), extractedText: excerpt(attempt.extractedText),
+        })),
+    }), null, 2);
+}
+
+async function copyDiagnostic(latest = false) {
+    let text = viewedDiagnosticText;
+    try {
+        if (latest) {
+            const detail = detailedRun || await readDiagnostic('run');
+            if (!detail) { toastr.warning('暂无调用详情，请先运行一次自检。', '墨提斯之镜'); return; }
+            text = formatDiagnosticForCopy(detail);
+        }
+        await copyTextToClipboard(text);
+        toastr.success('诊断已复制，可以直接粘贴发送。', '墨提斯之镜');
+    } catch {
+        openDialog('手动复制诊断', `<div>浏览器未允许自动复制，请长按下方内容全选复制。</div><textarea class="text_pole" readonly rows="16">${escapeHtml(text)}</textarea>`, '<button class="menu_button" data-dialog-action="back-to-logs">返回运行日志</button>');
+    }
+}
+
 async function openRunDetail(id, log = null) {
     const detail = id ? await loadRunDetail(id) : null;
+    viewedDiagnosticText = formatDiagnosticForCopy(detail, log);
     const summary = log ? `<div>${escapeHtml(log.detailMessage || log.message || '')}</div><div>${escapeHtml(log.detailHandling || log.handling || '')}</div>` : '';
     openDialog('调用详情', `<div class="stsc-muted">${escapeHtml(diagnosticStorageError)}</div>` + summary + (detail ? runDetailHtml(detail) : '<div class="stsc-muted">这条记录没有对应的调用详情，可能来自旧版本，或已超过保留上限。</div>'),
-        '<button class="menu_button" data-dialog-action="back-to-logs">返回运行日志</button>');
+        '<button class="menu_button" data-dialog-action="copy-diagnostic">一键复制诊断</button><button class="menu_button" data-dialog-action="back-to-logs">返回运行日志</button>');
 }
 
 async function openRecentRunDetails() {
@@ -6878,6 +6919,8 @@ function bindUiEvents() {
             openExtensionManagerForUpdate();
             return;
         }
+        if (action === 'copy-diagnostic') { void copyDiagnostic(); return; }
+        if (action === 'copy-latest-diagnostic') { void copyDiagnostic(true); return; }
         if (action === 'view-log-detail') {
             const log = normalizeSettings().logs.find(item => item.id === String($(this).data('log-id') || ''));
             if (log) void openRunDetail(log.runId, log);
