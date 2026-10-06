@@ -1,9 +1,10 @@
-import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider, buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText, readGenerationText, providerError, requestProvider, testConnection, readSelfCheckStream, readSelfCheckResponse, SELF_CHECK_PARSER_VERSION } from './api-providers.mjs?v=0.4.27';
+import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider, buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText, readGenerationText, providerError, requestProvider, testConnection, readSelfCheckStream, readSelfCheckResponse, SELF_CHECK_PARSER_VERSION } from './api-providers.mjs?v=0.4.28';
 
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.27';
+const STSC_REVIEWER_META_KEY = 'sillytavern_self_check_reviewer_latest';
+const STSC_VERSION = '0.4.28';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 10;
@@ -40,11 +41,10 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-10-06',
-    title: '每模型两次重试与部分答案保留',
+    title: '自检结果立即保存',
     changes: Object.freeze([
-        "自检按渠道和模型顺序执行，每模型最多2次；每渠道默认前2个模型，参与模型数可独立设为1～10。",
-        "正常结束但回答不完整时重试，完整成功即停止；超时、断网或异常断流仍不追加请求。",
-        "重试耗尽保留完成度最高的一整份回答，按设置交主模型补答或停止；已有答案仅以短题意和原答案交接。",
+        "副API自检结束后立即保存到上一轮自检，不再依赖正文完成；正文停止或断开后仍可查看问题、答案与依据。",
+        "区分自检结果和正文等待/停止状态；复盘继续使用上一份已完成正文对应的自检，避免跨轮配错。",
     ]),
 });
 
@@ -2898,7 +2898,7 @@ function buildDualApiTemporaryContext(instructions) {
 
 function getReviewSource(settings = normalizeSettings()) {
     if (!settings?.dualApi?.previousReview) return null;
-    const latest = getLatestResult();
+    const latest = ctx()?.chatMetadata?.[STSC_CHAT_META_KEY];
     if (!latest || latest.mode !== 'dual_api' || latest.chatId !== getCurrentChatId()) return null;
     const message = ctx()?.chat?.[Number(latest.messageId)];
     if (!message || message.is_user || message.is_system) return null;
@@ -3552,7 +3552,8 @@ function dualIncompleteMessage(parsed, questions) {
 async function saveLatestResult(result) {
     const context = ctx();
     if (!context?.chatMetadata) return;
-    context.chatMetadata[STSC_CHAT_META_KEY] = result;
+    context.chatMetadata[STSC_REVIEWER_META_KEY] = result;
+    if (!result.mainGenerationStatus || result.mainGenerationStatus === 'completed') context.chatMetadata[STSC_CHAT_META_KEY] = result;
     try {
         context.saveMetadataDebounced?.();
     } catch (error) {
@@ -3561,7 +3562,7 @@ async function saveLatestResult(result) {
 }
 
 function getLatestResult() {
-    return ctx()?.chatMetadata?.[STSC_CHAT_META_KEY] || null;
+    return ctx()?.chatMetadata?.[STSC_REVIEWER_META_KEY] || ctx()?.chatMetadata?.[STSC_CHAT_META_KEY] || null;
 }
 
 function latestHasUnreadIssue(latest = getLatestResult()) {
@@ -3931,6 +3932,28 @@ function makeLatestResult({ parsed, questions, mode, messageId, rawOverride = ''
     };
 }
 
+async function saveReviewerResult(parsed, questions, rawCheck, dualApiResult, previousReview) {
+    const latest = makeLatestResult({ parsed, questions, mode: 'dual_api', messageId: null,
+        rawOverride: rawCheck, statusOverride: parsed.status === 'ok' ? 'dual_ok' : parsed.status, dualApiResult });
+    latest.runId = detailedRun?.id;
+    latest.mainGenerationStatus = 'pending';
+    latest.previousReview = previousReview;
+    await saveLatestResult(latest);
+    renderAll();
+}
+
+function markReviewerMainStatus(status) {
+    const latest = getLatestResult();
+    if (latest?.runId !== detailedRun?.id || latest?.chatId !== getCurrentChatId() || latest?.mainGenerationStatus !== 'pending') return;
+    latest.mainGenerationStatus = status;
+    void saveLatestResult(latest);
+    renderAll();
+}
+
+function reviewerMainStatusText(latest) {
+    return ({ pending: '自检已保存；正文等待中', stopped: '自检已保存；正文已停止', ended_without_message: '自检已保存；正文未完成' })[latest?.mainGenerationStatus] || '';
+}
+
 function statusText(status) {
     return {
         ok: '自检完整',
@@ -4024,6 +4047,8 @@ async function handleMessageReceived(data) {
         latest = makeLatestResult({ parsed, questions, mode: 'single', messageId });
     }
 
+    latest.mainGenerationStatus = 'completed';
+    latest.runId = detailedRun?.id;
     updateDetailedRun({ status: 'completed', mainOutput: rawText, result: latest });
     refreshMessageDom(messageId, message);
     await saveLatestResult(latest);
@@ -4055,6 +4080,7 @@ function onGenerationEnded() {
             const mode = pendingRun.mode === 'dual_api' ? '双API' : '单API';
             addRuntimeLog('error', '本轮结果', `${character}：本轮生成已经结束，但插件没有收到可保存的AI正文。`, `本轮原本使用${mode}模式。请重新生成；如果连续发生，请检查主API连接和酒馆控制台。`);
             updateDetailedRun({ status: 'ended_without_message' });
+            markReviewerMainStatus('ended_without_message');
             pendingRun = null;
         }
     }, 5000);
@@ -4063,6 +4089,7 @@ function onGenerationEnded() {
 function onGenerationStopped() {
     activeDualController?.abort('user');
     updateDetailedRun({ status: 'stopped' });
+    markReviewerMainStatus('stopped');
     clearRuntimePrompts();
     if (pendingRun) {
         const character = runtimeCharacterLabel({ characterName: pendingRun.characterName || '' });
@@ -4143,6 +4170,8 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
             let rawCheck = initialResponse.text;
             let dualParsed = parseModelOutput(rawCheck, dualQuestions);
             let previousReview = parsePreviousReview(rawCheck);
+            await saveReviewerResult(dualParsed, dualQuestions, rawCheck, dualApiResult, previousReview);
+            if (pendingRun !== currentRun) { abort?.(true); return; }
             const missing = dualParsedMissingRequirements(dualParsed, dualQuestions);
             if (missing.length && settings.dualApi.failureMode === 'stop') {
                 const error = new Error(dualIncompleteMessage(dualParsed, dualQuestions));
@@ -4181,6 +4210,7 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
             if (error.code === 'cancelled' || pendingRun !== currentRun) { abort?.(true); return; }
             if (settings.dualApi.failureMode === 'stop') {
                 updateDetailedRun({ status: 'failed', decision: 'stop_generation', error: error.message });
+                markReviewerMainStatus('stopped');
                 pendingRun = null;
                 clearRuntimePrompts();
                 abort?.(true);
@@ -4343,7 +4373,7 @@ function renderCompact() {
 
     if (latest) {
         $('#stsc_compact_status').html(
-            `<span class="${statusClass(latest.status)}"><b>${statusIcon(latest.status)} ${escapeHtml(statusText(latest.status))}</b></span>` +
+            `<span class="${statusClass(latest.status)}"><b>${statusIcon(latest.status)} ${escapeHtml([statusText(latest.status), reviewerMainStatusText(latest)].filter(Boolean).join(" · "))}</b></span>` +
             `<br><span class="stsc-muted">${new Date(latest.timestamp).toLocaleString()}</span>`
         );
     } else {
@@ -4431,7 +4461,7 @@ function renderLatestTab() {
 
         latestHtml = `
             <div class="stsc-meta-row">
-                <span class="stsc-status-pill ${statusClass(latest.status)}">${statusIcon(latest.status)} ${escapeHtml(statusText(latest.status))}</span>
+                <span class="stsc-status-pill ${statusClass(latest.status)}">${statusIcon(latest.status)} ${escapeHtml([statusText(latest.status), reviewerMainStatusText(latest)].filter(Boolean).join(" · "))}</span>
                 <span class="stsc-status-pill">${escapeHtml(generationModeLabel(latest.mode))}</span>
                 <span class="stsc-status-pill">${latest.answeredCount}/${latest.expectedCount} 题</span>
                 <span class="stsc-status-pill">${new Date(latest.timestamp).toLocaleString()}</span>

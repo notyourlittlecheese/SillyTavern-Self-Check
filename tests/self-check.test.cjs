@@ -940,3 +940,54 @@ test('later poorer partial does not replace best response; uncertain failure sto
     const result=await h.call();
     assert.equal(result.text,better);assert.equal(h.calls.length,3);
 });
+
+
+test('failed first attempt then successful retry injects only successful answers and never aborts main generation', async () => {
+    for (const failureMode of ['stop','fallback_single']) {
+        for (const firstFailure of ['http','refusal','partial']) {
+            const h=harness(); h.settings.dualApi.failureMode=failureMode;
+            h.run("questions[0].handoffText='SHORT_A'; questions[1].handoffText='SHORT_B'");
+            let aborts=0;h.scope.abortMain=()=>aborts++;
+            const successful='<stsc_self_check><item id="q1"><answer>SUCCESS_A</answer></item><item id="q2"><answer>SUCCESS_B</answer><evidence>SUCCESS_EVIDENCE</evidence></item></stsc_self_check>';
+            h.mock(n=>n>1?h.response(200,{text:successful}):firstFailure==='http'?h.response(503,{error:'FIRST_ERROR'}):h.response(200,{text:firstFailure==='refusal'?'FIRST_REFUSAL':'<stsc_self_check><item id="q1"><answer>FIRST_PARTIAL</answer></item></stsc_self_check>'}));
+            await h.run("sillyTavernSelfCheckInterceptor([],0,abortMain,'normal')");
+            assert.equal(aborts,0);assert.deepEqual(h.calls.map(c=>c.model),['first','first']);
+            assert.equal(h.run('pendingRun.dualCheck'),successful);
+            assert.equal(h.run('pendingRun.supplementQuestions.length'),0);
+            assert.equal(h.run('detailedRun.decision'),'accepted');
+            assert.equal(h.run('detailedRun.status'),'running');
+            const text=h.run("runtimePromptTexts.get('stsc_dual_main')");
+            assert.ok(text.includes('SUCCESS_A'));assert.ok(text.includes('SUCCESS_B'));assert.ok(text.includes('SHORT_A'));
+            assert.ok(!/FIRST_ERROR|FIRST_REFUSAL|FIRST_PARTIAL|SUCCESS_EVIDENCE/.test(text));
+            h.scope.mainText=text;
+            h.run("captureRealRequest({messages:[{role:'assistant',content:mainText}],model:'main'})");
+            assert.ok(h.run('JSON.stringify(detailedRun.mainRequest)').includes('SUCCESS_A'));
+        }
+    }
+});
+
+
+test('reviewer result is saved before main reply and survives stop without replacing completed review source', async () => {
+    const h=harness();
+    h.context.chatMetadata={sillytavern_self_check_latest:{timestamp:1,mode:'dual_api',chatId:'chat-a',messageId:0,answers:[]}};
+    h.mock(()=>h.response(200,{text:h.good}));
+    await h.run("sillyTavernSelfCheckInterceptor([],0,()=>{},'normal')");
+    assert.equal(h.run('getLatestResult().answeredCount'),2);
+    assert.equal(h.run('getLatestResult().mainGenerationStatus'),'pending');
+    assert.equal(h.context.chatMetadata.sillytavern_self_check_latest.timestamp,1);
+    h.run('onGenerationStopped()');
+    assert.equal(h.run('getLatestResult().mainGenerationStatus'),'stopped');
+    assert.equal(h.run('getLatestResult().answers[0].answer'),'A');
+    assert.equal(h.context.chatMetadata.sillytavern_self_check_latest.timestamp,1);
+    h.run('pendingRun=null; detailedRun=null');
+    assert.equal(h.run('getLatestResult().answeredCount'),2);
+});
+
+test('stop-on-incomplete still saves available reviewer answers for last self-check page', async () => {
+    const h=harness();h.context.chatMetadata={};h.settings.dualApi.failureMode='stop';
+    h.mock(()=>h.response(200,{text:'<stsc_self_check><item id="q1"><answer>KEPT</answer></item></stsc_self_check>'}));
+    await h.run("sillyTavernSelfCheckInterceptor([],0,()=>{},'normal')");
+    assert.equal(h.run('getLatestResult().answers[0].answer'),'KEPT');
+    assert.equal(h.run('getLatestResult().mainGenerationStatus'),'stopped');
+    assert.equal(h.context.chatMetadata.sillytavern_self_check_latest,undefined);
+});
