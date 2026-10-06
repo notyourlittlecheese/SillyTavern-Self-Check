@@ -3,10 +3,10 @@ import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSi
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.23';
+const STSC_VERSION = '0.4.24';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
-const STSC_LOG_LIMIT = 500;
+const STSC_LOG_LIMIT = 10;
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
@@ -40,10 +40,11 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-10-06',
-    title: '同名预设QR原地覆盖',
+    title: '调用详情与运行记录保留上限',
     changes: Object.freeze([
-        "创建预设QR时，同名按钮自动原地更新为当前预设及其API绑定，保留按钮位置和外观。",
-        "覆盖成功后顶部弹窗提示新绑定；仅匹配墨提斯之镜自己的QR集合。",
+        "运行日志新增查看详情，可检查每次自检调用的渠道、模型、耗时、HTTP状态、具体报错和原始返回。",
+        "运行日志和调用详情各默认保留最近10条／轮，可在运行日志里设置1～500的上限，超出自动删除最旧记录。",
+        "仅清理运行生成的记录，不影响预设、资料或API配置；最新请求快照及每个聊天的上一轮自检仍各保留1份。",
     ]),
 });
 
@@ -120,6 +121,7 @@ const DEFAULT_SETTINGS = Object.freeze({
         failureMode: 'fallback_single',
         previousReview: false,
     },
+    runtimeRecordLimit: STSC_LOG_LIMIT,
     logs: [],
     logLastViewedAt: 0,
     presets: [],
@@ -231,12 +233,20 @@ function compactRuntimeLogMessage(level, stage, message, handling = '') {
     return source.length > 600 ? `${source.slice(0, 600)}…` : source;
 }
 
+function runtimeRecordLimit(settings = ctx()?.extensionSettings?.[STSC_MODULE]) {
+    const value = Number(settings?.runtimeRecordLimit);
+    return Number.isFinite(value) ? Math.max(1, Math.min(500, Math.floor(value))) : STSC_LOG_LIMIT;
+}
+
 function addRuntimeLog(level, stage, message, handling = '') {
     const settings = normalizeSettings();
     if (!settings) return;
     const compactMessage = compactRuntimeLogMessage(level, stage, message, handling);
-    settings.logs.unshift({ id: uid('log'), timestamp: Date.now(), level, stage: sanitizeLogText(stage), message: sanitizeLogText(compactMessage), handling: sanitizeLogText(handling).slice(0, 240) });
-    settings.logs = settings.logs.slice(0, STSC_LOG_LIMIT);
+    const safeMessage = sanitizeLogText(redactDetail(compactMessage));
+    const detailMessage = sanitizeLogText(redactDetail(message));
+    const detailHandling = sanitizeLogText(redactDetail(handling));
+    settings.logs.unshift({ runId: ['自检API', '本轮结果', '自检解析'].includes(stage) && detailedRun?.chatId === getCurrentChatId() ? detailedRun.id : null, detailMessage, detailHandling, id: uid('log'), timestamp: Date.now(), level, stage: sanitizeLogText(stage), message: safeMessage, handling: detailHandling.slice(0, 240) });
+    settings.logs = settings.logs.slice(0, runtimeRecordLimit(settings));
     saveSettings();
     renderLogBadge();
 }
@@ -334,16 +344,61 @@ function saveDiagnostic(key, value) {
         const db = await diagnosticDb();
         await new Promise((resolve, reject) => {
             const tx = db.transaction('latest', 'readwrite');
-            tx.objectStore('latest').put(copy, key);
+            const store = tx.objectStore('latest');
+            if (key !== 'prune') store.put(copy, key);
+            if (key === 'run' || key === 'prune') pruneDiagnosticStore(store, key === 'run' ? copy : null);
             tx.oncomplete = resolve;
             tx.onerror = () => reject(tx.error);
             tx.onabort = () => reject(tx.error);
         });
+        diagnosticStorageError = '';
     }).catch(error => {
         diagnosticStorageError = `详细日志暂未持久保存，当前页面仍可导出：${error?.message || error}`;
         console.warn('[STSC]', diagnosticStorageError);
     });
     return diagnosticWriteQueue;
+}
+
+function retainedRunIndex(index, run, limit) {
+    const entries = Array.isArray(index) ? index.filter(item => item?.id) : [];
+    if (run?.id) {
+        const previous = entries.findIndex(item => item.id === run.id);
+        if (previous >= 0) entries.splice(previous, 1);
+        entries.unshift({ id: run.id, startedAt: run.startedAt, kind: run.kind, status: run.status });
+    }
+    return entries.sort((a, b) => b.startedAt - a.startedAt).slice(0, limit);
+}
+
+function pruneDiagnosticStore(store, run) {
+    const request = store.get('run-index');
+    request.onsuccess = () => {
+        const previous = request.result || [];
+        const kept = retainedRunIndex(previous, run, runtimeRecordLimit());
+        const ids = new Set(kept.map(item => item.id));
+        for (const item of previous) if (!ids.has(item.id)) store.delete(`run:${item.id}`);
+        if (run?.id && ids.has(run.id)) store.put(run, `run:${run.id}`);
+        store.put(kept, 'run-index');
+    };
+}
+
+async function loadRunDetail(id) {
+    if (detailedRun?.id === id) return redactDetail(detailedRun);
+    const stored = await readDiagnostic(`run:${id}`);
+    if (stored) return redactDetail(stored);
+    const legacy = await readDiagnostic('run');
+    return legacy?.id === id ? redactDetail(legacy) : null;
+}
+
+async function applyRuntimeRecordLimit(value) {
+    const settings = normalizeSettings();
+    settings.runtimeRecordLimit = runtimeRecordLimit({ runtimeRecordLimit: value });
+    settings.logs = settings.logs.slice(0, settings.runtimeRecordLimit);
+    if (editDraft) {
+        editDraft.runtimeRecordLimit = settings.runtimeRecordLimit;
+        editDraft.logs = clone(settings.logs);
+    }
+    saveSettings();
+    await saveDiagnostic('prune', null);
 }
 
 async function readDiagnostic(key) {
@@ -578,8 +633,9 @@ function normalizeSettings() {
     settings.dualApi.failureMode = ['fallback_single', 'stop'].includes(settings.dualApi.failureMode) ? settings.dualApi.failureMode : 'fallback_single';
     settings.dualApi.previousReview = Boolean(settings.dualApi.previousReview);
     let compactedLegacyLogs = false;
+    settings.runtimeRecordLimit = runtimeRecordLimit(settings);
     if (!Array.isArray(settings.logs)) settings.logs = [];
-    settings.logs = settings.logs.filter(item => item && typeof item === 'object').slice(0, STSC_LOG_LIMIT);
+    settings.logs = settings.logs.filter(item => item && typeof item === 'object').slice(0, runtimeRecordLimit(settings));
     for (const item of settings.logs) {
         const alreadyCompact = /^(?:自检回答不完整|自检标签不完整|自检输出格式不完整|本轮没有检测到完整的自检输出)/.test(String(item.message || ''));
         if (item.stage === '自检解析' && !alreadyCompact) {
@@ -1989,6 +2045,8 @@ function commitEditDraft({ notify = true } = {}) {
     const context = ctx();
     if (!context?.extensionSettings) return;
     syncPresetApiConfig(editDraft);
+    const runtime = normalizeSettings();
+    for (const key of ['logs', 'logLastViewedAt', 'runtimeRecordLimit']) editDraft[key] = clone(runtime[key]);
     context.extensionSettings[STSC_MODULE] = clone(editDraft);
     const savedSettings = normalizeSettings();
     if (!savedSettings?.enabled) {
@@ -3064,6 +3122,8 @@ async function callDualApiCandidate(candidate, { chat, questions, references, te
         body.stream = settings.dualApi.stream !== false;
     } catch (error) {
         if (activeDualController === controller) activeDualController = null;
+        detailedRun?.attempts.push({ label: candidate.label, startedAt, status: 'configuration_error', error: redactDetail(error.message), elapsedMs: Date.now() - startedAt });
+        persistDetailedRun();
         error.code = 'configuration_error';
         error.explicitFailure = true;
         throw error;
@@ -3083,6 +3143,7 @@ async function callDualApiCandidate(candidate, { chat, questions, references, te
             method: 'POST', headers: { ...(ctx()?.getRequestHeaders?.() || {}), 'Content-Type': 'application/json' },
             signal: controller.signal, body: JSON.stringify(body),
         });
+        attempt.httpStatus = response.status;
         const contentType = response.headers?.get?.('content-type') || '';
         if (response.ok && /text\/event-stream/i.test(contentType)) {
             attempt.transport = 'stream';
@@ -5055,6 +5116,7 @@ function runtimeLogHtml(item) {
     return `<article class="stsc-log-item is-${escapeHtml(item.level || 'info')}" data-log-id="${escapeHtml(item.id)}">
         <div class="stsc-log-head"><b>${escapeHtml(labels[item.level] || '记录')}｜${escapeHtml(item.stage || '运行')}</b><time>${new Date(item.timestamp).toLocaleString()}</time></div>
         <div>${escapeHtml(item.message || '')}</div>${item.handling ? `<div class="stsc-muted">处理：${escapeHtml(item.handling)}</div>` : ''}
+        <button class="menu_button stsc-small-button" type="button" data-dialog-action="view-log-detail" data-log-id="${escapeHtml(item.id)}">查看详情</button>
         <button class="menu_button stsc-small-button" type="button" data-dialog-action="delete-log" data-log-id="${escapeHtml(item.id)}">删除</button>
     </article>`;
 }
@@ -5065,8 +5127,35 @@ function openLogDialog() {
     saveSettings();
     renderLogBadge();
     const list = settings.logs.length ? settings.logs.map(runtimeLogHtml).join('') : '<div class="stsc-empty">还没有运行记录。完成一次角色回复或手动检查更新后，这里会显示结果。</div>';
-    openDialog('运行日志', `<div class="stsc-log-summary">成功、部分完成和失败都会记录。日志会写明时间、角色卡、运行模式、完成题数、正文与API情况；本地最多保留最近 ${STSC_LOG_LIMIT} 条，且不会记录API密钥。最新调用详情另存于当前浏览器，仅保留一轮，包含完整上下文和输出，可在等待期间导出。</div><div class="stsc-log-list">${list}</div>`,
-        '<button class="menu_button" type="button" data-dialog-action="clear-runtime-cache">清理缓存</button><button class="menu_button" type="button" data-dialog-action="export-logs">导出日志</button><button class="menu_button" type="button" data-dialog-action="export-latest-detail">导出最新调用详情</button><button class="menu_button stsc-danger-button" type="button" data-dialog-action="ask-clear-logs">清除日志</button>');
+    openDialog('运行日志', `<div class="stsc-log-summary">成功、部分完成和失败都会记录。日志会写明时间、角色卡、运行模式、完成题数、正文与API情况；运行日志和调用详情各保留最近 ${runtimeRecordLimit(settings)} 条／轮，超出自动删除最旧记录。详情存于当前浏览器，包含请求与输出，密钥会隐藏。旧日志若未保存详情则无法补回。预设、资料和API配置不受此限制。${escapeHtml(diagnosticStorageError)}</div><div class="stsc-field"><label>运行记录保留上限（每类，1～500，默认10）</label><input id="stsc_record_limit" class="text_pole" type="number" min="1" max="500" step="1" value="${runtimeRecordLimit(settings)}"><button class="menu_button" type="button" data-dialog-action="apply-record-limit">保存上限并清理超出记录</button></div><div class="stsc-log-list">${list}</div>`,
+        '<button class="menu_button" type="button" data-dialog-action="recent-run-details">最近调用详情</button><button class="menu_button" type="button" data-dialog-action="clear-runtime-cache">清理缓存</button><button class="menu_button" type="button" data-dialog-action="export-logs">导出日志</button><button class="menu_button" type="button" data-dialog-action="export-latest-detail">导出最新调用详情</button><button class="menu_button stsc-danger-button" type="button" data-dialog-action="ask-clear-logs">清除日志</button>');
+}
+
+function runDetailHtml(detail) {
+    const pre = value => `<pre style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto">${escapeHtml(typeof value === 'string' ? value : JSON.stringify(value, null, 2))}</pre>`;
+    return `<div>状态：${escapeHtml(detail.status || '')} · ${new Date(detail.startedAt).toLocaleString()}</div>
+        ${detail.error ? pre(detail.error) : ''}
+        ${(detail.attempts || []).map((attempt, index) => `<article class="stsc-log-item">
+            <b>第 ${index + 1} 次：${escapeHtml(attempt.label || attempt.request?.model || '未知模型')}</b>
+            <div>状态：${escapeHtml(attempt.status || '')} · HTTP：${escapeHtml(String(attempt.httpStatus ?? '未收到状态码'))} · 耗时：${attempt.elapsedMs == null ? '进行中' : `${(attempt.elapsedMs / 1000).toFixed(1)} 秒`}</div>
+            ${attempt.error ? pre(attempt.error) : ''}
+            <details><summary>原始返回 / 已收到的输出</summary>${pre(attempt.rawResponse || attempt.extractedText || '未收到返回内容')}</details>
+            <details><summary>请求内容（密钥已隐藏）</summary>${pre(attempt.request || {})}</details>
+        </article>`).join('') || '<div class="stsc-muted">本轮没有外部自检API调用记录。</div>'}
+        <details><summary>本轮完整诊断数据</summary>${pre(detail)}</details>`;
+}
+
+async function openRunDetail(id, log = null) {
+    const detail = id ? await loadRunDetail(id) : null;
+    const summary = log ? `<div>${escapeHtml(log.detailMessage || log.message || '')}</div><div>${escapeHtml(log.detailHandling || log.handling || '')}</div>` : '';
+    openDialog('调用详情', `<div class="stsc-muted">${escapeHtml(diagnosticStorageError)}</div>` + summary + (detail ? runDetailHtml(detail) : '<div class="stsc-muted">这条记录没有对应的调用详情，可能来自旧版本，或已超过保留上限。</div>'),
+        '<button class="menu_button" data-dialog-action="back-to-logs">返回运行日志</button>');
+}
+
+async function openRecentRunDetails() {
+    const index = await readDiagnostic('run-index') || [];
+    const list = index.map(item => `<div class="stsc-log-item"><span>${new Date(item.startedAt).toLocaleString()} · ${item.kind === 'test' ? '测试' : '生成'} · ${escapeHtml(item.status || '')}</span><button class="menu_button" data-dialog-action="view-run-detail" data-run-id="${escapeHtml(item.id)}">查看详情</button></div>`).join('');
+    openDialog('最近调用详情', list || '<div class="stsc-empty">暂无历史调用详情，新运行会自动保存。</div>', '<button class="menu_button" data-dialog-action="back-to-logs">返回运行日志</button>');
 }
 
 function exportRuntimeLogs() {
@@ -6791,6 +6880,22 @@ function bindUiEvents() {
             openExtensionManagerForUpdate();
             return;
         }
+        if (action === 'view-log-detail') {
+            const log = normalizeSettings().logs.find(item => item.id === String($(this).data('log-id') || ''));
+            if (log) void openRunDetail(log.runId, log);
+            return;
+        }
+        if (action === 'view-run-detail') { void openRunDetail(String($(this).data('run-id') || '')); return; }
+        if (action === 'recent-run-details') { void openRecentRunDetails(); return; }
+        if (action === 'back-to-logs') { openLogDialog(); return; }
+        if (action === 'apply-record-limit') {
+            void applyRuntimeRecordLimit($('#stsc_record_limit').val()).then(() => {
+                openLogDialog();
+                if (diagnosticStorageError) toastr.warning(`上限已保存，但详情清理失败：${diagnosticStorageError}`, '墨提斯之镜');
+                else toastr.success('保留上限已保存，超出的旧记录已清理。', '墨提斯之镜');
+            });
+            return;
+        }
         if (action === 'export-latest-detail') { void exportLatestDetail(); return; }
         if (action === 'export-logs') {
             exportRuntimeLogs();
@@ -7366,6 +7471,8 @@ async function initialize() {
     if (!context) return;
 
     normalizeSettings();
+    saveSettings();
+    void saveDiagnostic('prune', null);
     const html = await context.renderExtensionTemplateAsync(STSC_FOLDER, 'settings');
     // 管理器直接挂到 body，避免被“扩展”侧栏的宽度、overflow 或 transform 裁切。
     $('#stsc_manager_overlay, #stsc_dialog_overlay, #stsc_floating_root, #stsc_floating_panel').remove();

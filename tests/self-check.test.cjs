@@ -177,13 +177,14 @@ test('main response merges local supplement ids, strips the check block and reta
     assert.equal(h.calls.length, 1);
 });
 
-test('IndexedDB write queue keeps only the latest run and survives in-memory reset', async () => {
+test('IndexedDB keeps bounded run history and latest alias across in-memory resets', async () => {
     const h = harness(); const data = new Map();
     h.scope.indexedDB = { open() {
         const request = {};
         request.result = { createObjectStore() {}, transaction() {
             const tx = { objectStore: () => ({
                 put(value, key) { data.set(key, structuredClone(value)); queueMicrotask(() => tx.oncomplete()); },
+                delete(key) { data.delete(key); },
                 get(key) { const read = {}; queueMicrotask(() => { read.result = structuredClone(data.get(key)); read.onsuccess(); }); return read; },
             }) }; return tx;
         } };
@@ -193,7 +194,18 @@ test('IndexedDB write queue keeps only the latest run and survives in-memory res
     await h.run('diagnosticWriteQueue');
     h.run('detailedRun = null');
     const saved = await h.run("readDiagnostic('run')");
-    assert.equal(data.size, 1); assert.equal(saved.kind, 'generation'); assert.equal(saved.attempts.length, 0);
+    assert.equal(data.size, 4); assert.equal(saved.kind, 'generation'); assert.equal(saved.attempts.length, 0);
+    assert.equal(data.get('run-index').length,2);
+    for (let i=0;i<15;i++) await h.run(`saveDiagnostic('run', {id:'run-'+${i},startedAt:${i}+10000000000000,attempts:[]})`);
+    assert.equal(data.get('run-index').length,10);
+    assert.equal([...data.keys()].filter(key=>key.startsWith('run:')).length,10);
+    assert.equal(data.has('run:run-0'),false);
+    assert.equal((await h.run("loadRunDetail('run-14')")).id,'run-14');
+    h.settings.runtimeRecordLimit=3;
+    await h.run("saveDiagnostic('prune',null)");
+    assert.equal(data.get('run-index').length,3);
+    assert.equal([...data.keys()].filter(key=>key.startsWith('run:')).length,3);
+    assert.equal(data.has('prune'),false);
 });
 
 test('slow diagnostic storage never blocks capture before main request', async () => {
@@ -815,4 +827,39 @@ test('QR overwrite reports save failure and refuses unsupported update without d
     assert.equal(await h.run("createPresetQr(settings.presets[1].id,'A')"),false);
     assert.equal(h.notices.at(-1).level,'error');
     assert.equal(set.qrList.length,1);
+});
+
+
+test('runtime retention trims logs only, preserves preset data and cannot be undone by stale editor draft', async () => {
+    const h=harness();
+    h.run(`normalizeSettings=realNormalizeSettings; normalizeSettings();
+        settings.logs=Array.from({length:30},(_,i)=>({id:'log-'+i,timestamp:30-i}));
+        globalThis.presetBefore=JSON.stringify(settings.presets);
+        globalThis.apiBefore=JSON.stringify(settings.dualApi);
+        editDraft=clone(settings); normalizeSettings();`);
+    assert.equal(h.settings.logs.length,10);
+    await h.run('applyRuntimeRecordLimit(3)');
+    assert.equal(h.settings.logs.length,3);
+    assert.equal(h.run('editDraft.logs.length'),3);
+    assert.equal(h.run('JSON.stringify(settings.presets)===presetBefore'),true);
+    assert.equal(h.run('JSON.stringify(settings.dualApi)===apiBefore'),true);
+    assert.equal(h.run('runtimeRecordLimit({})'),10);
+    assert.equal(h.run('runtimeRecordLimit({runtimeRecordLimit:-2})'),1);
+});
+
+test('log details link to their original run and escape raw provider errors', async () => {
+    const h=harness();
+    h.run(`normalizeSettings=realNormalizeSettings; normalizeSettings();
+        addRuntimeLog=${source.match(/function addRuntimeLog[\s\S]*?\n}/)[0]};
+        renderLogBadge=()=>{};
+        beginDetailedRun('generation');
+        addRuntimeLog('error','自检API','FULL ERROR private-test-key','full handling');`);
+    const log=h.settings.logs[0];
+    assert.equal(log.runId,h.run('detailedRun.id'));
+    assert.ok(!log.detailMessage.includes('private-test-key'));
+    h.scope.detail={startedAt:Date.now(),status:'failed',attempts:[{label:'站点 / model-x',httpStatus:429,error:'<script>bad</script>',rawResponse:'original failure',elapsedMs:1234}]};
+    const html=h.run('runDetailHtml(detail)');
+    assert.ok(html.includes('model-x')); assert.ok(html.includes('429')); assert.ok(html.includes('1.2 秒'));
+    assert.ok(html.includes('&lt;script&gt;')); assert.ok(!html.includes('<script>'));
+    assert.ok(html.includes('original failure'));
 });
