@@ -1,9 +1,9 @@
-import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider, buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText, readGenerationText, providerError, requestProvider, testConnection, readSelfCheckStream, readSelfCheckResponse, SELF_CHECK_PARSER_VERSION } from './api-providers.mjs?v=0.4.26';
+import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider, buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText, readGenerationText, providerError, requestProvider, testConnection, readSelfCheckStream, readSelfCheckResponse, SELF_CHECK_PARSER_VERSION } from './api-providers.mjs?v=0.4.27';
 
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.26';
+const STSC_VERSION = '0.4.27';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 10;
@@ -40,11 +40,11 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-10-06',
-    title: '一键复制诊断与流式识别补充修复',
+    title: '每模型两次重试与部分答案保留',
     changes: Object.freeze([
-        "运行日志新增复制最新诊断，调用详情新增一键复制诊断；附带当前与记录版本、解析器版本、模型、报错和返回片段，隐藏密钥并省略完整请求上下文。",
-        "复制受限时尝试兼容复制，仍失败则提供可手动选择的诊断文本。",
-        "修复SSE前导空行与id/retry字段识别，并为解析模块添加版本参数避免旧缓存。",
+        "自检按渠道和模型顺序执行，每模型最多2次；每渠道默认前2个模型，参与模型数可独立设为1～10。",
+        "正常结束但回答不完整时重试，完整成功即停止；超时、断网或异常断流仍不追加请求。",
+        "重试耗尽保留完成度最高的一整份回答，按设置交主模型补答或停止；已有答案仅以短题意和原答案交接。",
     ]),
 });
 
@@ -1331,9 +1331,9 @@ function providerControlsHtml(config, key) {
         <label>供应商</label>
         <select class="text_pole" data-stsc-provider="${escapeHtml(key)}">${Object.entries(API_PROVIDERS).map(([id, item]) => `<option value="${id}" ${providerId(config.provider) === id ? 'selected' : ''}>${escapeHtml(item.name)}</option>`).join('')}</select>
         <details class="stsc-provider-help"><summary>接口填写说明</summary><div class="stsc-muted">${escapeHtml(getProvider(config).hint)} 切换供应商会清空此渠道的密钥和已选模型，不自动连接。</div></details>
-        <label>此渠道最多尝试次数（1～10，默认2）</label>
+        <label>此渠道尝试前几个模型（1～10，默认2）</label>
         <input class="text_pole" type="number" min="1" max="10" step="1" data-stsc-attempts="${escapeHtml(key)}" value="${channelAttemptLimit(config)}">
-        <div class="stsc-muted">按下方模型顺序尝试；次数超过模型数量时从头轮换。仅明确失败才继续。</div>
+        <div class="stsc-muted">每个模型最多调用2次，再换下一个；完整成功即停止。明确失败或已结束但回答不完整时继续。</div>
         <label>手动填写模型ID（多个用逗号分隔，按顺序尝试）</label>
         <input class="text_pole" type="text" data-stsc-models="${escapeHtml(key)}" value="${escapeHtml(selectedDualApiModels(config).join(', '))}">
         <button class="menu_button stsc-small-button" type="button" data-stsc-probe="${escapeHtml(key)}" ${providerConnectionBusy ? 'disabled' : ''}>测试此渠道首选模型连接</button>
@@ -1507,7 +1507,7 @@ function channelAttemptLimit(config) {
 
 function channelPlannedModels(config) {
     const models = selectedDualApiModels(config);
-    return models.length ? Array.from({ length: channelAttemptLimit(config) }, (_, index) => models[index % models.length]) : [];
+    return models.slice(0, channelAttemptLimit(config)).flatMap(model => [model, model]);
 }
 
 const expandedApiChannelIds = new Set();
@@ -1689,7 +1689,7 @@ function dualApiFallbacksHtml(dual) {
         <details class="stsc-fallback-api-card" data-fallback-index="${index}" data-channel-id="${escapeHtml(item.id)}" ${expandedApiChannelIds.has(item.id) ? 'open' : ''}>
             <summary class="stsc-channel-summary">
                 <span class="stsc-channel-summary-title">${item.enabled !== false ? '●' : '○'} ${escapeHtml(channelDisplayName(item, index + 1))}${Number(dual.primaryIndex) === index + 1 ? ' · 主渠道' : ''}</span>
-                <span class="stsc-muted">${escapeHtml(getProvider(item).name)} · ${channelAttemptLimit(item)} 次 · ${item.enabled !== false ? '已启用' : '已停用'}</span>
+                <span class="stsc-muted">${escapeHtml(getProvider(item).name)} · 前 ${channelAttemptLimit(item)} 个模型 · 每模型2次 · ${item.enabled !== false ? '已启用' : '已停用'}</span>
                 <span class="stsc-channel-summary-model">${escapeHtml(selectedDualApiModels(item)[0] || '未选择模型')}</span>
             </summary>
             <div class="stsc-channel-body">
@@ -3129,7 +3129,7 @@ async function callDualApiCandidate(candidate, { chat, questions, references, te
         throw error;
     }
     const detail = detailedRun;
-    const attempt = { label: candidate.label, channelIndex: candidate.channelIndex, channelAttempt: candidate.channelAttempt, startedAt, timeoutSeconds, request: redactDetail(body), status: 'waiting' };
+    const attempt = { label: candidate.label, channelIndex: candidate.channelIndex, channelAttempt: candidate.channelAttempt, modelAttempt: candidate.modelAttempt, startedAt, timeoutSeconds, request: redactDetail(body), status: 'waiting' };
     detail?.attempts.push(attempt);
     persistDetailedRun();
     let timeout;
@@ -3220,15 +3220,33 @@ async function callDualApiSelfCheck(args, { candidateLimit = 0, replay = false }
         channels.get(model.channelIndex).push(model);
     }
     const candidates = singleAttempt ? models.slice(0, 1) : [...channels.values()].flatMap(channel =>
-        Array.from({ length: channelAttemptLimit(channel[0]) }, (_, index) => ({
-            ...channel[index % channel.length], channelAttempt: index + 1,
-        })));
+        channel.slice(0, channelAttemptLimit(channel[0])).flatMap((model, index) =>
+            [1, 2].map(modelAttempt => ({ ...model, modelAttempt, channelAttempt: index * 2 + modelAttempt }))));
     if (!candidates.length) throw new Error('尚未配置有效的自检API地址和模型。');
     const failures = [];
+    let bestPartial = null;
+    let bestScore = -1;
+    const partialResult = attempts => ({ ...bestPartial, attempts, failedApis: failures });
     for (let index = 0; index < candidates.length; index++) {
         const candidate = candidates[index];
         try {
             const result = await callDualApiCandidate(candidate, args, { replay });
+            const parsed = parseModelOutput(result.text, args.questions);
+            const missing = dualParsedMissingRequirements(parsed, args.questions);
+            if (missing.length) {
+                // Keep one coherent response rather than combining potentially conflicting reviewers.
+                const answered = parsed.answers.filter(answer => answer.answer?.trim()).length;
+                const score = (args.questions.length - missing.length) * (args.questions.length + 1) + answered;
+                if (score > bestScore) { bestScore = score; bestPartial = result; }
+                const message = dualIncompleteMessage(parsed, args.questions);
+                failures.push({ label: candidate.label, message, code: 'incomplete_response' });
+                const attempt = detailedRun?.attempts.at(-1);
+                if (attempt) { attempt.status = 'incomplete_response'; attempt.error = message; }
+                updateDetailedRun({ decision: index + 1 < candidates.length ? 'retry_after_incomplete_response' : 'partial_attempts_exhausted', failures });
+                if (index + 1 < candidates.length) continue;
+                updateDetailedRun({ selectedApi: bestPartial.apiLabel });
+                return partialResult(index + 1);
+            }
             updateDetailedRun({ decision: 'received', selectedApi: candidate.label });
             if (failures.length) addRuntimeLog('warning', '自检API', `${candidate.label}调用成功；已停止后续候选。`, failures.map(f => `${f.label}：${f.message}`).join('；'));
             return { ...result, attempts: index + 1, failedApis: failures };
@@ -3237,6 +3255,10 @@ async function callDualApiSelfCheck(args, { candidateLimit = 0, replay = false }
             updateDetailedRun({ failures });
             if (error.code === 'cancelled' || !error.explicitFailure || index + 1 >= candidates.length) {
                 error.failedApis = failures;
+                if (bestPartial && error.code !== 'cancelled') {
+                    updateDetailedRun({ decision: 'retain_partial_after_failure', selectedApi: bestPartial.apiLabel });
+                    return partialResult(index + 1);
+                }
                 throw error;
             }
             updateDetailedRun({ decision: candidates[index + 1].channelIndex === candidate.channelIndex ? 'retry_channel_after_explicit_failure' : 'next_channel_after_explicit_failure' });
@@ -4897,8 +4919,8 @@ function renderSettingsTab() {
                 </div>
                 <div class="stsc-field">
                     <label>失败重试与渠道切换</label>
-                    <label class="checkbox_label"><input id="stsc_dual_retry_transient" type="checkbox" ${dual.retryTransient ? 'checked' : ''}> 明确失败时按各渠道的次数设置重试，再切换备用渠道</label>
-                    <div class="stsc-muted">每个渠道默认2次，可在渠道设置中调整；次数超过模型数时从头轮换。关闭后总计只请求一次；超时、断网或已有回答均不追加调用。</div>
+                    <label class="checkbox_label"><input id="stsc_dual_retry_transient" type="checkbox" ${dual.retryTransient ? 'checked' : ''}> 明确失败或回答不完整时，每模型最多尝试2次，再按顺序切换</label>
+                    <div class="stsc-muted">每个渠道默认尝试前2个模型，每模型最多2次；可独立调整参与模型数量。关闭后总计只请求一次；超时、断网、异常断流不追加调用。</div>
                 </div>
             </div>
 
@@ -4937,7 +4959,7 @@ function renderSettingsTab() {
                         <option value="fallback_single" ${dual.failureMode !== 'stop' ? 'selected' : ''}>交给酒馆主模型自检并继续正文</option>
                         <option value="stop" ${dual.failureMode === 'stop' ? 'selected' : ''}>停止本轮生成，不调用酒馆主模型</option>
                     </select>
-                    <div class="stsc-muted">全部渠道明确失败，或超时、断网时执行此选项。收到不完整回答不重复请求；接管模式保留已有答案并补题，停止模式直接停止本轮。</div>
+                    <div class="stsc-muted">全部渠道明确失败，或超时、断网时执行此选项。正常结束但回答不完整时先按顺序重试；仍未完成则保留完成度最高的一整份答案。接管模式交给主模型补题，停止模式不生成正文。</div>
                 </div>
                 <div class="stsc-dual-library-note">
                     <b>资料库在双API模式下</b>

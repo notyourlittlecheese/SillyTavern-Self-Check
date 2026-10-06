@@ -50,15 +50,15 @@ test('valid response stops after first candidate, including provider warning', a
     }
 });
 
-test('explicit failures never exceed two candidates and never retry same candidate', async () => {
+test('explicit failures try each of the first two models twice', async () => {
     const h = harness(); h.mock(() => h.response(429, { error: { message: 'rate limit' } }));
     await assert.rejects(h.call());
-    assert.deepEqual(h.calls.map(c => c.model), ['first', 'second']);
+    assert.deepEqual(h.calls.map(c => c.model), ['first', 'first', 'second', 'second']);
 });
 
 test('second candidate can succeed after explicit failure', async () => {
     const h = harness(); h.mock(n => h.response(n === 1 ? 401 : 200, n === 1 ? { error: 'invalid key' } : { text: h.good }));
-    assert.equal((await h.call()).model, 'second'); assert.equal(h.calls.length, 2);
+    assert.equal((await h.call()).model, 'first'); assert.equal(h.calls.length, 2);
 });
 
 test('timeout waits configured 120 seconds, aborts once and never switches', async () => {
@@ -84,10 +84,10 @@ test('test and disabled fallback each limit to a single request', async () => {
     }
 });
 
-test('incomplete answers go to main supplement without any additional API request', async () => {
+test('incomplete answers exhaust model retries before main supplement', async () => {
     const h = harness(); h.mock(() => h.response(200, { text: '<stsc_self_check><item id="q2"><answer>B</answer></item></stsc_self_check>' }));
     await h.run("sillyTavernSelfCheckInterceptor([], 0, () => {}, 'normal')");
-    assert.equal(h.calls.length, 1);
+    assert.equal(h.calls.length, 4);
     assert.equal(h.run('pendingRun.supplementQuestions.length'), 2);
     assert.equal(h.run('pendingRun.dualParsed.answers[0].answer'), '');
     assert.equal(h.run('pendingRun.dualParsed.answers[1].answer'), 'B');
@@ -97,7 +97,7 @@ test('incomplete answers go to main supplement without any additional API reques
 test('two failures fall back to main API when takeover is selected', async () => {
     const h = harness(); h.settings.dualApi.failureMode = 'fallback_single'; h.mock(() => h.response(500, { error: 'unavailable' }));
     await h.run("sillyTavernSelfCheckInterceptor([], 0, () => { throw Error('unexpected stop'); }, 'normal')");
-    assert.equal(h.calls.length, 2); assert.equal(h.run('pendingRun.mode'), 'single');
+    assert.equal(h.calls.length, 4); assert.equal(h.run('pendingRun.mode'), 'single');
     assert.equal(h.run("runtimePromptTexts.has('stsc_main')"), true);
 });
 
@@ -152,7 +152,7 @@ test('diagnostics capture request and raw response, omit credentials and preserv
     const h = harness(); h.run("beginDetailedRun('test')");
     h.mock(() => h.response(200, { text: 'x'.repeat(20000) + 'private-test-key' })); await h.call();
     const detail = h.run('JSON.stringify(detailedRun)'); assert.ok(!detail.includes('private-test-key')); assert.ok(!detail.includes('proxy_password')); assert.ok(detail.includes('x'.repeat(20000)));
-    assert.equal(h.run('detailedRun.attempts.length'), 1); assert.equal(h.run('detailedRun.attempts[0].httpStatus'), 200);
+    assert.equal(h.run('detailedRun.attempts.length'), 4); assert.equal(h.run('detailedRun.attempts[0].httpStatus'), 200);
 });
 
 test('quiet calls cannot overwrite the latest real snapshot', async () => {
@@ -174,7 +174,7 @@ test('main response merges local supplement ids, strips the check block and reta
     assert.equal(h.run('savedResult.answers[1].answer'), 'B');
     assert.equal(h.run('savedResult.answers[2].answer'), 'C');
     assert.equal(h.run('savedResult.formatIssues.length'), 0);
-    assert.equal(h.calls.length, 1);
+    assert.equal(h.calls.length, 4);
 });
 
 test('IndexedDB keeps bounded run history and latest alias across in-memory resets', async () => {
@@ -698,7 +698,7 @@ test('channel plan attempts models 1/2 per enabled channel, skips model 3, honor
     h.settings.dualApi.primaryIndex=1;
     h.mock(()=>h.response(503,{error:'unavailable'}));
     await assert.rejects(h.call());
-    assert.deepEqual(h.calls.map(c=>c.model),['b1','b2','c1','c1','first','second']);
+    assert.deepEqual(h.calls.map(c=>c.model),['b1','b1','b2','b2','c1','c1','first','first','second','second']);
 });
 
 test('stop option aborts generation and clears all plugin injections after failures or incomplete answers', async () => {
@@ -711,7 +711,7 @@ test('stop option aborts generation and clears all plugin injections after failu
         assert.equal(aborts,1); assert.equal(h.run('pendingRun'),null);
         assert.equal(h.run('runtimePromptTexts.size'),0);
         assert.equal(h.run('detailedRun.decision'),'stop_generation');
-        assert.equal(h.calls.length,incomplete?1:4);
+        assert.equal(h.calls.length,8);
     }
 });
 
@@ -752,11 +752,11 @@ test('silent stream timeout never switches channel and obeys stop mode', async (
     assert.equal(h.run('runtimePromptTexts.size'),0);
 });
 
-test('per-channel budgets use configured models and cycle only within that channel', async () => {
+test('per-channel model limits repeat each included model exactly twice', async () => {
     const h=harness(); h.settings.dualApi.maxAttempts=3;
     h.settings.dualApi.fallbacks=[{id:'b',endpoint:'https://b.test/v1',models:['b1','b2'],maxAttempts:4},{id:'c',endpoint:'https://c.test/v1',models:['c1'],maxAttempts:1}];
     h.mock(()=>h.response(503,{error:'down'})); await assert.rejects(h.call());
-    assert.deepEqual(h.calls.map(c=>c.model),['first','second','third','b1','b2','b1','b2','c1']);
+    assert.deepEqual(h.calls.map(c=>c.model),['first','first','second','second','third','third','b1','b1','b2','b2','c1','c1']);
     assert.equal(h.run('channelAttemptLimit({})'),2);
     assert.equal(h.run('channelAttemptLimit({maxAttempts:99})'),10);
     assert.equal(h.run('channelAttemptLimit({maxAttempts:0})'),1);
@@ -766,7 +766,7 @@ test('per-channel budgets use configured models and cycle only within that chann
 test('model reorder keeps exact membership, changes execution order, and rejects stale lists', () => {
     const h=harness();
     assert.equal(h.run("applySelectedModelOrder(settings.dualApi,['third','first','second'])"),true);
-    assert.deepEqual(Array.from(h.run('channelPlannedModels(settings.dualApi)')),['third','first']);
+    assert.deepEqual(Array.from(h.run('channelPlannedModels(settings.dualApi)')),['third','third','first','first']);
     assert.equal(h.run("applySelectedModelOrder(settings.dualApi,['third','first','first'])"),false);
     assert.equal(h.run("applySelectedModelOrder(settings.dualApi,['unknown','first','second'])"),false);
 });
@@ -791,7 +791,7 @@ test('custom channel names reach candidate results and defaults stay compatible'
     h.settings.dualApi.maxAttempts = 1;
     h.settings.dualApi.fallbacks = [{id:'b',name:'备用直连',endpoint:'https://b.test/v1',models:['b1']}];
     assert.equal(h.run('getDualApiCandidates(settings.dualApi)[0].apiName'), '常用站');
-    h.mock(n => n === 1 ? h.response(503,{error:'down'}) : h.response(200,{text:h.good}));
+    h.mock(n => n <= 2 ? h.response(503,{error:'down'}) : h.response(200,{text:h.good}));
     const result = await h.call();
     assert.equal(result.apiName, '备用直连');
     assert.equal(h.run('channelDisplayName({})'), '主API配置');
@@ -910,4 +910,33 @@ test('clipboard denial falls back to legacy copy and removes temporary textarea'
     h.scope.document={createElement:()=>({style:{},setAttribute(){},select(){selected=true;},remove(){removed=true;}}),body:{appendChild(){}},execCommand:()=>true};
     await h.run("copyTextToClipboard('diagnosis')");
     assert.equal(selected,true);assert.equal(removed,true);
+});
+
+
+test('partial reply retries same model, complete retry stops the plan', async () => {
+    const h=harness();
+    h.mock(n=>h.response(200,{text:n===1?'<stsc_self_check><item id="q1"><answer>partial</answer></item></stsc_self_check>':h.good}));
+    const result=await h.call();
+    assert.deepEqual(h.calls.map(c=>c.model),['first','first']);
+    assert.equal(result.text,h.good);
+});
+
+test('best coherent partial survives later explicit failures and handoff uses short questions only', async () => {
+    const h=harness();
+    h.run("questions[0].handoffText='SHORT_A'; questions[1].handoffText='SHORT_B'");
+    h.mock(n=>n===1?h.response(200,{text:'<stsc_self_check><item id="q1"><answer>KEEP_A</answer></item></stsc_self_check>'}):h.response(503,{error:'unavailable'}));
+    await h.run("sillyTavernSelfCheckInterceptor([],0,()=>{},'normal')");
+    assert.equal(h.calls.length,4);
+    const text=h.run("runtimePromptTexts.get('stsc_supplement')");
+    assert.ok(text.includes('KEEP_A'));assert.ok(text.includes('SHORT_A'));assert.ok(text.includes('SHORT_B'));
+    assert.ok(!text.includes('first question'));assert.ok(!text.includes('second question'));
+    assert.equal(h.run('pendingRun.supplementQuestions.length'),1);
+});
+
+test('later poorer partial does not replace best response; uncertain failure stops retries', async () => {
+    const h=harness();
+    const better='<stsc_self_check><item id="q1"><answer>BEST</answer></item><item id="q2"><answer>B</answer></item></stsc_self_check>';
+    h.mock(n=>{if(n===3)throw Error('connection lost');return h.response(200,{text:n===1?better:'<stsc_self_check><item id="q1"><answer>WORSE</answer></item></stsc_self_check>'});});
+    const result=await h.call();
+    assert.equal(result.text,better);assert.equal(h.calls.length,3);
 });
