@@ -3,7 +3,7 @@ import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSi
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.22';
+const STSC_VERSION = '0.4.23';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -39,11 +39,11 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-10-05',
-    title: '渠道自定义名称与简洁手柄',
+    releasedAt: '2026-10-06',
+    title: '同名预设QR原地覆盖',
     changes: Object.freeze([
-        "主渠道与备用渠道支持自定义名称，随通用预设保存，并显示在渠道卡片、执行顺序和日志中。",
-        "模型拖动手柄改为单个上下箭头，保留长按拖动排序。"
+        "创建预设QR时，同名按钮自动原地更新为当前预设及其API绑定，保留按钮位置和外观。",
+        "覆盖成功后顶部弹窗提示新绑定；仅匹配墨提斯之镜自己的QR集合。",
     ]),
 });
 
@@ -870,8 +870,8 @@ function openPresetQrDialog(preset) {
         <div class="stsc-field" style="margin-top:10px"><label>QR 按钮名称</label>
         <input id="stsc_qr_label" class="text_pole" maxlength="80" value="${escapeHtml(preset.name)}"></div>
         <input id="stsc_qr_preset_id" type="hidden" value="${escapeHtml(preset.id)}">
-        <div class="stsc-muted">创建到酒馆原生“${STSC_QR_SET}”集合并显示。点一次启用此预设和 API，再点关闭插件；点其他预设的 QR 切换。可创建多个按钮，之后在酒馆快速回复设置里改名或删除。</div>`,
-        '<button class="menu_button" data-dialog-action="cancel">取消</button><button class="menu_button" data-dialog-action="create-preset-qr">创建 QR</button>');
+        <div class="stsc-muted">创建到酒馆原生“${STSC_QR_SET}”集合并显示。点一次启用此预设和 API，再点关闭插件；点其他预设的 QR 切换。可创建多个按钮；填写已有按钮的同名名称会直接覆盖其预设绑定，并保留按钮位置。之后也可在酒馆快速回复设置里改名或删除。</div>`,
+        '<button class="menu_button" data-dialog-action="cancel">取消</button><button class="menu_button" data-dialog-action="create-preset-qr">创建 / 覆盖 QR</button>');
 }
 
 async function createPresetQr(id, label) {
@@ -889,13 +889,18 @@ async function createPresetQr(id, label) {
         }
         let set = api.getSetByName(STSC_QR_SET);
         if (set && (set.disableSend || set.injectInput)) throw new Error('此 QR 集合设置已被修改，请在快速回复设置中关闭“禁止发送”和“注入输入”后重试。');
-        if (set && api.getQrByLabel(STSC_QR_SET, label)) throw new Error('已有同名 QR，请换个名称；原按钮不会被覆盖。');
+        const existingQr = set ? api.getQrByLabel(STSC_QR_SET, label) : null;
+        if (existingQr && !api.updateQuickReply) throw new Error('当前酒馆不支持原地更新 QR，请更新快速回复扩展后重试。');
         if (!set) set = await api.createSet(STSC_QR_SET, { disableSend: false, injectInput: false, placeBeforeInput: false });
-        api.createQuickReply(STSC_QR_SET, label, {
+        const qrContent = {
             message: `/stsc-preset-toggle ${encodeURIComponent(preset.id)}`,
             title: `切换“${preset.name}”及其 API；再次点击关闭墨提斯之镜`,
-            showLabel: true, isHidden: false,
-        });
+        };
+        if (existingQr) {
+            api.updateQuickReply(STSC_QR_SET, label, qrContent);
+        } else {
+            api.createQuickReply(STSC_QR_SET, label, { ...qrContent, showLabel: true, isHidden: false });
+        }
         await set.save();
         // Native save() logs HTTP failures without rejecting; verify this write before reporting success.
         const response = await fetch('/api/quick-replies/save', {
@@ -907,7 +912,9 @@ async function createPresetQr(id, label) {
         if (link) link.isVisible = true;
         api.settings.isEnabled = true;
         api.settings.save();
-        presetQrNotice('success', `已创建 QR“${label}”，可在聊天框旁使用。`);
+        presetQrNotice('success', existingQr
+            ? `已覆盖 QR“${label}”，现已绑定预设“${preset.name}”及其 API 配置。`
+            : `已创建 QR“${label}”，可在聊天框旁使用。`);
         return true;
     } catch (error) {
         presetQrNotice('error', error?.message || '创建 QR 失败，请稍后重试。');

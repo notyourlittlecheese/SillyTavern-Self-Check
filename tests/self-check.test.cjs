@@ -488,6 +488,7 @@ function qrHarness() {
         getQrByLabel: (name,label) => sets.get(name)?.qrList.find(q => q.label === label),
         async createSet(name, options) { const set = {name,...options,qrList:[],save:async()=>{}}; sets.set(name,set); return set; },
         createQuickReply(name,label,props) { const qr = {label,...props}; sets.get(name).qrList.push(qr); return qr; },
+        updateQuickReply(name,label,props) { const qr=api.getQrByLabel(name,label); Object.assign(qr,props); return qr; },
         addGlobalSet(name,isVisible) { const set=sets.get(name); if (!api.settings.config.setList.some(x=>x.set===set)) api.settings.config.setList.push({set,isVisible}); },
     };
     h.scope.quickReplyApi = api;
@@ -549,7 +550,19 @@ test('creates multiple native named QR buttons containing only preset IDs, enabl
     assert.equal(h.api.settings.config.setList[0].isVisible,true);
     assert.ok(!JSON.stringify(h.writes).includes('private-test-key'));
     assert.ok(!JSON.stringify(h.writes).includes('second-secret'));
-    assert.equal(await h.run("createPresetQr(settings.presets[1].id, '1.0')"),false);
+    const original = set.qrList[0];
+    original.icon='fa-star'; original.showLabel=false;
+    assert.equal(await h.run("createPresetQr(settings.presets[1].id, ' 1.0 ')"),true);
+    assert.equal(set.qrList[0],original);
+    assert.equal(original.icon,'fa-star'); assert.equal(original.showLabel,false);
+    assert.equal(original.message,'/stsc-preset-toggle '+encodeURIComponent(h.settings.presets[1].id));
+    assert.ok(original.title.includes('2.0'));
+    assert.ok(h.notices.at(-1).message.includes('已覆盖 QR“1.0”'));
+    assert.equal(h.notices.at(-1).options.positionClass,'toast-top-center');
+    assert.equal(h.writes.at(-1).body.qrList[0].message,original.message);
+    h.getCommand().callback({},encodeURIComponent(h.settings.presets[1].id));
+    assert.equal(h.settings.generalPresetId,h.settings.presets[1].id);
+    assert.equal(h.settings.dualApi.apiKey,'second-secret');
     assert.equal(set.qrList.length,2);
 });
 
@@ -786,4 +799,20 @@ test('channel names survive normalization and independent general preset switchi
         normalizeSettings(); activateGeneralPreset(current,current.presets[0]); normalizeSettings();`);
     assert.equal(h.settings.dualApi.name,'常用站');
     assert.equal(h.settings.dualApi.fallbacks[0].name,'备用直连');
+});
+
+
+test('QR overwrite reports save failure and refuses unsupported update without duplicating buttons', async () => {
+    const h=qrHarness();
+    await h.run("createPresetQr(settings.presets[0].id,'A')");
+    const set=[...h.sets.values()][0];
+    const originalMessage=set.qrList[0].message;
+    const update=h.api.updateQuickReply; delete h.api.updateQuickReply;
+    assert.equal(await h.run("createPresetQr(settings.presets[1].id,'A')"),false);
+    assert.equal(set.qrList[0].message,originalMessage);
+    h.api.updateQuickReply=update;
+    h.scope.fetch=async()=>({ok:false});
+    assert.equal(await h.run("createPresetQr(settings.presets[1].id,'A')"),false);
+    assert.equal(h.notices.at(-1).level,'error');
+    assert.equal(set.qrList.length,1);
 });
