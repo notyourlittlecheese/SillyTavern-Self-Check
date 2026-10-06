@@ -1,9 +1,9 @@
-import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider, buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText, readGenerationText, providerError, requestProvider, testConnection, readSelfCheckStream } from './api-providers.mjs';
+import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider, buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText, readGenerationText, providerError, requestProvider, testConnection, readSelfCheckStream, readSelfCheckResponse } from './api-providers.mjs';
 
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.24';
+const STSC_VERSION = '0.4.25';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 10;
@@ -40,11 +40,10 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-10-06',
-    title: '调用详情与运行记录保留上限',
+    title: '修复流式自检返回误判',
     changes: Object.freeze([
-        "运行日志新增查看详情，可检查每次自检调用的渠道、模型、耗时、HTTP状态、具体报错和原始返回。",
-        "运行日志和调用详情各默认保留最近10条／轮，可在运行日志里设置1～500的上限，超出自动删除最旧记录。",
-        "仅清理运行生成的记录，不影响预设、资料或API配置；最新请求快照及每个聊天的上一轮自检仍各保留1份。",
+        "按实际响应内容识别流式自检，兼容中转站把SSE误标为JSON或普通文本，避免有答案却误报0题。",
+        "保留正常结束但无答案时切换下一候选、断流不重发的行为，并增加回归测试。",
     ]),
 });
 
@@ -3144,14 +3143,13 @@ async function callDualApiCandidate(candidate, { chat, questions, references, te
             signal: controller.signal, body: JSON.stringify(body),
         });
         attempt.httpStatus = response.status;
-        const contentType = response.headers?.get?.('content-type') || '';
-        if (response.ok && /text\/event-stream/i.test(contentType)) {
-            attempt.transport = 'stream';
-            const result = await readSelfCheckStream(response, {
-                signal: controller.signal,
-                onActivity: () => { resetIdleTimeout(); attempt.lastActivityAt = Date.now(); },
-                onProgress: ({textLength}) => { attempt.receivedCharacters = textLength; },
-            });
+        const result = await readSelfCheckResponse(response, {
+            signal: controller.signal,
+            onActivity: () => { resetIdleTimeout(); attempt.lastActivityAt = Date.now(); },
+            onProgress: ({textLength}) => { attempt.receivedCharacters = textLength; },
+        });
+        attempt.transport = result.transport;
+        if (result.transport === 'stream') {
             attempt.httpStatus = response.status;
             attempt.rawResponse = redactDetail(result.rawResponse);
             attempt.extractedText = redactDetail(result.text);
@@ -3160,7 +3158,7 @@ async function callDualApiCandidate(candidate, { chat, questions, references, te
             return {text: result.text, attempts: 1, compact: false, apiLabel: candidate.label, apiName: candidate.apiName, model: candidate.model};
         }
         attempt.transport = 'json';
-        const responseText = await response.text();
+        const responseText = result.rawResponse;
         if (controller.signal.aborted) throw new Error('请求已停止');
         attempt.httpStatus = response.status;
         attempt.rawResponse = redactDetail(responseText);

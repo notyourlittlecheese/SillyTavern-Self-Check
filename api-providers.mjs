@@ -313,3 +313,48 @@ export async function readSelfCheckStream(response, { signal, onActivity = () =>
         reader.releaseLock();
     }
 }
+
+
+// Relays may label SSE as JSON/plain text; inspect bytes instead of trusting the header.
+export async function readSelfCheckResponse(response, options = {}) {
+    if (!response.body?.getReader) {
+        const rawResponse = await response.text();
+        if (!/^\s*(?:data:|event:|:)/.test(rawResponse)) return { transport: 'json', rawResponse };
+        const bytes = new TextEncoder().encode(rawResponse);
+        let consumed = false;
+        const reader = { read: async () => consumed ? { done: true } : (consumed = true, { value: bytes, done: false }), cancel: async () => {}, releaseLock() {} };
+        return { transport: 'stream', ...await readSelfCheckStream({ body: { getReader: () => reader } }, options) };
+    }
+    const reader = response.body.getReader();
+    const chunks = [];
+    const decoder = new TextDecoder();
+    let prefix = '', ended = false;
+    try {
+        while (!ended && prefix.length < 8192) {
+            const part = await reader.read(); ended = part.done;
+            if (ended) break;
+            chunks.push(part.value);
+            if (part.value.byteLength) options.onActivity?.();
+            prefix += decoder.decode(part.value, { stream: true });
+            if (/^\s*(?:data:|event:|:|[\[{])/.test(prefix) || prefix.includes('\n')) break;
+        }
+        if (/^\s*(?:data:|event:|:)/.test(prefix)) {
+            const replay = { read: async () => chunks.length ? { value: chunks.shift(), done: false } : ended ? { done: true } : reader.read(), cancel: reason => reader.cancel(reason), releaseLock() {} };
+            return { transport: 'stream', ...await readSelfCheckStream({ body: { getReader: () => replay } }, options) };
+        }
+        let rawResponse = prefix;
+        while (!ended) {
+            const part = await reader.read(); ended = part.done;
+            if (!ended) {
+                if (part.value.byteLength) options.onActivity?.();
+                rawResponse += decoder.decode(part.value, { stream: true });
+            }
+        }
+        rawResponse += decoder.decode();
+        if (options.signal?.aborted) throw new Error('请求已停止');
+        return { transport: 'json', rawResponse };
+    } finally {
+        try { await reader.cancel(); } catch { /* already closed */ }
+        reader.releaseLock();
+    }
+}

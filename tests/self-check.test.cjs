@@ -863,3 +863,22 @@ test('log details link to their original run and escape raw provider errors', as
     assert.ok(html.includes('&lt;script&gt;')); assert.ok(!html.includes('<script>'));
     assert.ok(html.includes('original failure'));
 });
+
+
+test('SSE mislabeled as JSON is decoded before parsing and stops after first success', async () => {
+    const h=harness(); let calls=0;
+    const raw=': PING\n\ndata: '+JSON.stringify({choices:[{delta:{content:h.good}}]})+'\n\ndata: [DONE]\n\n';
+    const bytes=new TextEncoder().encode(raw);
+    h.scope.fetch=async()=>{calls++;return new Response(new ReadableStream({start(c){for(const byte of bytes)c.enqueue(Uint8Array.of(byte));c.close();}}),{headers:{'content-type':'application/json'}});};
+    const result=await h.call();
+    assert.equal(result.text,h.good); assert.equal(calls,1);
+});
+
+test('completed empty SSE retries next model but interrupted SSE never retries', async () => {
+    for(const done of [true,false]) {
+        const h=harness(); let calls=0;
+        h.scope.fetch=async()=>{calls++;return new Response(calls===1 ? (done?'data: [DONE]\n\n':': PING\n\n') : JSON.stringify({text:h.good}),{headers:{'content-type':'text/plain'}});};
+        if(done) {const result=await h.call();assert.equal(result.text,h.good);assert.equal(calls,2);}
+        else {await assert.rejects(h.call());assert.equal(calls,1);}
+    }
+});
