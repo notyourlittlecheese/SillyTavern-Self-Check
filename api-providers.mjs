@@ -218,11 +218,28 @@ export async function requestProvider(route, body, { fetchImpl = globalThis.fetc
     return payload;
 }
 
+export function safetyRefusalError() {
+    const error = new Error('供应商安全策略拒绝了本次请求；已停止，不重试、不切换渠道，也不交给主模型。');
+    error.code = 'safety_refusal'; error.explicitFailure = false;
+    return error;
+}
+
+export function isExplicitSafetyRefusal(text) {
+    const value=String(text || '').trim();
+    if (value.length > 2500 || /<stsc_self_check\b/i.test(value)) return false;
+    return /^(?:(?:i(?:'m| am) sorry|sorry)[,.!]?\s*)?i (?:cannot|can't|am unable to) (?:fulfill|assist|help|provide|generate|comply)/i.test(value)
+        && /safety (?:guidelines|polic)|content polic|prohibit|not allowed|harmful/i.test(value)
+        || /^(?:抱歉[，,。]?\s*)?(?:我)?(?:无法|不能|不可以)(?:协助|帮助|提供|生成|满足)/.test(value)
+        && /安全(?:政策|策略|准则)|内容政策|违反.*政策/.test(value);
+}
+
 export function readGenerationText(payload) {
-    if (payload?.promptFeedback?.blockReason || ['SAFETY', 'RECITATION', 'PROHIBITED_CONTENT'].includes(payload?.candidates?.[0]?.finishReason)) {
-        throw new Error('供应商未返回可用文本；请检查内容限制或更换可用模型。');
+    if (payload?.promptFeedback?.blockReason || ['SAFETY', 'RECITATION', 'PROHIBITED_CONTENT'].includes(payload?.candidates?.[0]?.finishReason)
+        || payload?.choices?.[0]?.finish_reason === 'content_filter' || payload?.choices?.[0]?.message?.refusal) {
+        throw safetyRefusalError();
     }
     const text = extractResponseText(payload);
+    if (isExplicitSafetyRefusal(text)) throw safetyRefusalError();
     if (!text) {
         const error = new Error('接口连接成功，但未返回最终文本；请确认模型支持文本回复，并尝试增加最大回复长度。');
         error.transient = true;
@@ -252,10 +269,16 @@ export async function readSelfCheckStream(response, { signal, onActivity = () =>
     };
     const processFrame = frame => {
         const data = frame.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).replace(/^ /, '')).join('\n');
-        if (!data) return;
+        // Relays may emit a bare JSON error after heartbeat comments instead of a data frame.
+        const bare = !data ? frame.split('\n').filter(line => !/^(?:\s*:|event:|id:|retry:)/.test(line)).join('\n').trim() : '';
+        let bareError = null;
+        if (bare.startsWith('{')) {
+            try { const parsed = JSON.parse(bare); if (parsed?.error || parsed?.type === 'error') bareError = parsed; } catch { /* Truncated JSON remains an uncertain disconnect. */ }
+        }
+        if (!data && !bareError) return;
         if (data.trim() === '[DONE]') { finished = true; return; }
         let payload;
-        try { payload = JSON.parse(data); } catch { throw fail('自检流式数据格式异常；不自动重发。'); }
+        try { payload = bareError || JSON.parse(data); } catch { throw fail('自检流式数据格式异常；不自动重发。'); }
         if (payload.error || payload.type === 'error') {
             const error = providerError(Number(payload.error?.code) || 500, payload);
             const uncertain = /timeout|timed out|ECONNRESET|超时/i.test(JSON.stringify(payload.error || payload));
@@ -265,7 +288,9 @@ export async function readSelfCheckStream(response, { signal, onActivity = () =>
         }
         const candidate = payload.candidates?.[0];
         if (payload.promptFeedback?.blockReason || ['SAFETY','RECITATION','PROHIBITED_CONTENT'].includes(candidate?.finishReason)
-            || payload.choices?.[0]?.finish_reason === 'content_filter') throw fail('供应商未返回可用文本；请检查内容限制或渠道配置。', true);
+            || payload.choices?.[0]?.finish_reason === 'content_filter' || payload.choices?.[0]?.delta?.refusal || payload.choices?.[0]?.message?.refusal) {
+            throw safetyRefusalError();
+        }
         let delta = '';
         if (payload.type === 'content_block_delta' && payload.delta?.type === 'text_delta') delta = payload.delta.text || '';
         else if (payload.type === 'content_block_start' && payload.content_block?.type === 'text') delta = payload.content_block.text || '';
@@ -302,6 +327,7 @@ export async function readSelfCheckStream(response, { signal, onActivity = () =>
         buffer += decoder.decode();
         if (!finished && buffer.trim()) processFrame(buffer);
         if (!finished && !terminal) throw fail('自检流式连接提前结束，未收到完成标记；不自动重发。');
+        if (isExplicitSafetyRefusal(text)) throw safetyRefusalError();
         if (!text.trim()) throw fail('自检API已结束，但没有返回最终文本。', true);
         return { text, rawResponse: raw };
     } catch (error) {
@@ -359,4 +385,4 @@ export async function readSelfCheckResponse(response, options = {}) {
     }
 }
 
-export const SELF_CHECK_PARSER_VERSION = "sse-sniff-2";
+export const SELF_CHECK_PARSER_VERSION = "sse-sniff-4";

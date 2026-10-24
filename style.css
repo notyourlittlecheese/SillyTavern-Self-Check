@@ -2642,3 +2642,17 @@ body.stsc-modal-open {
 .stsc-model-pill.is-dragging { outline: 2px solid currentColor; opacity: .8; }
 .stsc-model-pill.is-dragging .stsc-model-drag-handle { cursor: grabbing; }
 .stsc-selected-models[data-model-sort-list] .stsc-model-order-button { min-width: 34px; min-height: 36px; border-radius: 6px; }
+
+/* Compact, mobile-friendly API groups. */
+#stsc_manager_overlay .stsc-api-group {border:1px solid var(--SmartThemeBorderColor, #8886);border-radius:12px;padding:12px;margin:12px 0;min-width:0;}
+#stsc_manager_overlay .stsc-api-group > summary {cursor:pointer;padding:8px 0;overflow-wrap:anywhere;}
+#stsc_manager_overlay .stsc-channel-options {margin:6px 0;padding:8px;border:1px solid var(--SmartThemeBorderColor, #8886);border-radius:8px;}
+#stsc_manager_overlay .stsc-channel-options > summary {cursor:pointer;}
+#stsc_manager_overlay .stsc-priority-row {display:flex;gap:6px;align-items:center;margin:8px 0;}
+#stsc_manager_overlay .stsc-priority-row > span {flex:1;min-width:0;overflow-wrap:anywhere;}
+#stsc_manager_overlay .stsc-priority-row button {flex:none;min-width:32px;}
+#stsc_manager_overlay .stsc-api-group .stsc-field {gap:8px;min-width:0;}
+#stsc_manager_overlay .stsc-api-group h4 {margin:8px 0;}
+#stsc_manager_overlay .stsc-api-group .text_pole {max-width:100%;box-sizing:border-box;}
+#stsc_manager_overlay textarea.stsc-question-editor {min-height:320px;height:45vh;max-height:75vh;resize:vertical;line-height:1.6;}
+@media(max-width:600px){#stsc_manager_overlay textarea.stsc-question-editor{min-height:280px;height:48vh;}#stsc_manager_overlay .stsc-primary-api-card .stsc-grid-2{display:grid;grid-template-columns:1fr;}}

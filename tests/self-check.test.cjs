@@ -11,7 +11,7 @@ function harness() {
     let timerId = 0;
     const settings = { enabled: true, mode: 'dual_api', injection: {}, presets: [], dualApi: {
         endpoint: 'https://example.test/v1', apiKey: 'private-test-key', models: ['first', 'second', 'third'],
-        fallbacks: [], timeoutSeconds: 120, maxTokens: 4096, retryTransient: true, contextMode: 'recent5',
+        fallbacks: [], perModelAttempts: 2, timeoutSeconds: 120, maxTokens: 4096, retryTransient: true, contextMode: 'recent5',
     } };
     const context = { chat: [{ is_user: true, mes: 'request' }], chatId: 'chat-a', extensionSettings: { sillytavern_self_check: settings }, setExtensionPrompt() {} };
     const scope = vm.createContext({
@@ -896,7 +896,7 @@ test('copy diagnosis distinguishes live and run versions, redacts keys and omits
     const h=harness();
     h.scope.detail={version:'old-version',status:'failed',attempts:[{label:'test',request:{model:'m',stream:true,messages:[{content:'PRIVATE_PROMPT'}]},error:'private-test-key',rawResponse:'data: [DONE]',transport:'json'}]};
     const text=h.run('formatDiagnosticForCopy(detail)'); const parsed=JSON.parse(text);
-    assert.equal(parsed.runVersion,'old-version'); assert.equal(parsed.currentParserVersion,'sse-sniff-2');
+    assert.equal(parsed.runVersion,'old-version'); assert.equal(parsed.currentParserVersion,'sse-sniff-4');
     assert.ok(!text.includes('PRIVATE_PROMPT')); assert.ok(!text.includes('private-test-key'));
     assert.equal(parsed.attempts[0].model,'m'); assert.equal(parsed.attempts[0].rawResponse,'data: [DONE]');
     let copied='';h.scope.navigator={clipboard:{writeText:async value=>{copied=value;}}};
@@ -990,4 +990,54 @@ test('stop-on-incomplete still saves available reviewer answers for last self-ch
     assert.equal(h.run('getLatestResult().answers[0].answer'),'KEPT');
     assert.equal(h.run('getLatestResult().mainGenerationStatus'),'stopped');
     assert.equal(h.context.chatMetadata.sillytavern_self_check_latest,undefined);
+});
+
+
+test('HTTP 200 heartbeat plus bare bad_response retries in configured model order', async () => {
+    const h=harness();const models=[];
+    h.scope.fetch=async(_url,init)=>{
+        models.push(JSON.parse(init.body).model);
+        return new Response(models.length<=2 ? ': PING\n\n'+JSON.stringify({error:{message:'Please try again later',type:'new_api_error',code:'bad_response'}}) : JSON.stringify({text:h.good}));
+    };
+    const result=await h.call();
+    assert.deepEqual(models,['first','first','second']);assert.equal(result.text,h.good);
+    assert.equal(result.failedApis.length,2);
+    assert.ok(result.failedApis.every(f=>f.code==='provider_failure'));
+});
+
+test('default calls each model once and honors cross-channel priorities without duplicates', async () => {
+    const h=harness(); delete h.settings.dualApi.perModelAttempts;
+    h.settings.dualApi.fallbacks=[{id:'backup',enabled:true,endpoint:'https://backup.test/v1',models:['other','last'],maxAttempts:1}];
+    h.settings.dualApi.candidatePriority=[{channelKey:'backup',model:'last'},{channelKey:'primary',model:'second'},{channelKey:'backup',model:'last'}];
+    h.mock(()=>h.response(503,{error:'overloaded'})); await assert.rejects(h.call());
+    assert.deepEqual(h.calls.map(c=>c.model),['last','second','first','other']);
+    h.settings.dualApi.candidatePriority=[];
+    assert.deepEqual(Array.from(h.run('dualApiAttemptPlan(settings.dualApi)'),c=>c.model),['first','second','other']);
+    h.settings.dualApi.fallbacks[0].enabled=false;
+    h.settings.dualApi.candidatePriority=[{channelKey:'backup',model:'last'}];
+    assert.deepEqual(Array.from(h.run('dualApiAttemptPlan(settings.dualApi)'),c=>c.model),['first','second']);
+});
+
+test('safety refusal stops retry and main takeover even with earlier partial answers', async () => {
+    for (const partialFirst of [false,true]) {
+        const h=harness(); h.settings.dualApi.failureMode='fallback_single';
+        h.mock(n=>h.response(200,n===1&&partialFirst?{text:'<stsc_self_check><item id="q1"><answer>A</answer></item></stsc_self_check>'}:{choices:[{message:{content:'I cannot fulfill this request. My safety guidelines prohibit this content.'},finish_reason:'content_filter'}]}));
+        let stopped=false;h.scope.stop=()=>{stopped=true;};
+        await h.run("sillyTavernSelfCheckInterceptor([],0,stop,'normal')");
+        assert.equal(stopped,true);assert.equal(h.calls.length,partialFirst?2:1);
+        assert.equal(h.run('pendingRun'),null);assert.equal(h.run('runtimePromptTexts.size'),0);
+    }
+});
+
+test('priority and per-model attempts survive preset binding and serialization', () => {
+    const h=harness();
+    h.run(`normalizeSettings=realNormalizeSettings;const s=normalizeSettings();
+        s.dualApi.perModelAttempts=1;s.dualApi.candidatePriority=[{channelKey:'primary',model:'second'}];
+        syncPresetApiConfig(s);globalThis.restoredSettings=JSON.parse(JSON.stringify(s));`);
+    h.context.extensionSettings.sillytavern_self_check=h.scope.restoredSettings;
+    h.run('normalizeSettings()');
+    const restored=h.context.extensionSettings.sillytavern_self_check;
+    assert.equal(restored.dualApi.perModelAttempts,1);
+    assert.equal(restored.dualApi.candidatePriority[0].model,'second');
+    assert.equal(restored.presets.find(p=>p.id===restored.generalPresetId).apiConfig.dualApi.candidatePriority[0].model,'second');
 });

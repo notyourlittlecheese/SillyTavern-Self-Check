@@ -1,10 +1,10 @@
-import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider, buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText, readGenerationText, providerError, requestProvider, testConnection, readSelfCheckStream, readSelfCheckResponse, SELF_CHECK_PARSER_VERSION } from './api-providers.mjs?v=0.4.28';
+import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider, buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText, readGenerationText, providerError, requestProvider, testConnection, readSelfCheckStream, readSelfCheckResponse, SELF_CHECK_PARSER_VERSION } from './api-providers.mjs?v=0.4.30';
 
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
 const STSC_REVIEWER_META_KEY = 'sillytavern_self_check_reviewer_latest';
-const STSC_VERSION = '0.4.28';
+const STSC_VERSION = '0.4.30';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 10;
@@ -40,12 +40,14 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-10-06',
-    title: '自检结果立即保存',
+    releasedAt: '2026-10-24',
+    title: '调用排序与清晰的失败诊断',
     changes: Object.freeze([
-        "副API自检结束后立即保存到上一轮自检，不再依赖正文完成；正文停止或断开后仍可查看问题、答案与依据。",
-        "区分自检结果和正文等待/停止状态；复盘继续使用上一份已完成正文对应的自检，避免跨轮配错。",
-    ]),
+        "明确安全拒答单独提示并停止本轮，不重试、不切换、不交给主模型。",
+        "支持跨渠道模型优先列表，取消后恢复默认排序；每模型默认调用一次，可选两次。",
+        "API设置分组折叠，预设完整问题编辑框加大。",
+        "修复心跳后直接返回中转JSON错误的识别。"
+]),
 });
 
 const REFERENCE_TYPE_CONFIG = Object.freeze({
@@ -114,6 +116,8 @@ const DEFAULT_SETTINGS = Object.freeze({
         timeoutSeconds: 120,
         maxAttempts: 2,
         retryTransient: true,
+        perModelAttempts: 1,
+        candidatePriority: [],
         stream: true,
         contextMode: 'recent5',
         customTurns: 5,
@@ -624,6 +628,8 @@ function normalizeSettings() {
     settings.dualApi.maxTokens = clampNumber(settings.dualApi.maxTokens, 256, 12000, 4096);
     settings.dualApi.timeoutSeconds = clampNumber(settings.dualApi.timeoutSeconds, 120, 600, 120);
     settings.dualApi.maxAttempts = channelAttemptLimit(settings.dualApi);
+    settings.dualApi.perModelAttempts = perModelAttemptLimit(settings.dualApi);
+    settings.dualApi.candidatePriority = normalizeCandidatePriority(settings.dualApi.candidatePriority);
     settings.dualApi.retryTransient = Boolean(settings.dualApi.retryTransient);
     settings.dualApi.stream = settings.dualApi.stream !== false;
     // beta.3：聊天范围只保留“默认最近5轮 / 自定义 / 全部”。旧界面的跟随、10轮、20轮统一迁移为最近5轮。
@@ -1331,14 +1337,16 @@ function providerControlsHtml(config, key) {
         <label>供应商</label>
         <select class="text_pole" data-stsc-provider="${escapeHtml(key)}">${Object.entries(API_PROVIDERS).map(([id, item]) => `<option value="${id}" ${providerId(config.provider) === id ? 'selected' : ''}>${escapeHtml(item.name)}</option>`).join('')}</select>
         <details class="stsc-provider-help"><summary>接口填写说明</summary><div class="stsc-muted">${escapeHtml(getProvider(config).hint)} 切换供应商会清空此渠道的密钥和已选模型，不自动连接。</div></details>
+        <details class="stsc-channel-options"><summary>模型数量、手填ID与连接测试</summary><div class="stsc-field">
         <label>此渠道尝试前几个模型（1～10，默认2）</label>
         <input class="text_pole" type="number" min="1" max="10" step="1" data-stsc-attempts="${escapeHtml(key)}" value="${channelAttemptLimit(config)}">
-        <div class="stsc-muted">每个模型最多调用2次，再换下一个；完整成功即停止。明确失败或已结束但回答不完整时继续。</div>
+        <div class="stsc-muted">默认顺序只尝试前N个模型，优先列表中明确指定的模型仍会执行。</div>
         <label>手动填写模型ID（多个用逗号分隔，按顺序尝试）</label>
         <input class="text_pole" type="text" data-stsc-models="${escapeHtml(key)}" value="${escapeHtml(selectedDualApiModels(config).join(', '))}">
         <button class="menu_button stsc-small-button" type="button" data-stsc-probe="${escapeHtml(key)}" ${providerConnectionBusy ? 'disabled' : ''}>测试此渠道首选模型连接</button>
         <div class="stsc-muted">只发送一句测试文字，不发送角色卡与聊天；会产生少量API用量，不自动保存设置。</div>
         <div class="stsc-muted">${escapeHtml(current?.message || '尚未测试当前配置。')}</div>
+        </div></details>
     </div>`;
 }
 
@@ -1382,6 +1390,23 @@ async function testProviderChannel(key) {
 
 function bindProviderControls() {
     const overlay = $('#stsc_manager_overlay');
+    overlay.on('click', '[data-priority-action]', function () {
+        const dual = getUiSettings().dualApi;
+        const items = normalizeCandidatePriority(dual.candidatePriority);
+        const action = this.dataset.priorityAction, index = Number(this.dataset.priorityIndex);
+        if (action === 'add') {
+            const value = $('#stsc_priority_candidate').val(); if (!value) return;
+            try { items.push(JSON.parse(value)); } catch { return; }
+        } else if (action === 'clear') items.splice(0);
+        else if (action === 'remove') items.splice(index, 1);
+        else { const target=index+(action==='up'?-1:1); if(items[index] && items[target]) [items[index],items[target]]=[items[target],items[index]]; }
+        dual.candidatePriority=normalizeCandidatePriority(items);
+        markDirty(); renderSettingsTab();
+    });
+    overlay.on('change', '#stsc_per_model_attempts', function () {
+        getUiSettings().dualApi.perModelAttempts=perModelAttemptLimit({perModelAttempts:this.value});
+        markDirty(); renderSettingsTab();
+    });
     overlay.on('change', '[data-stsc-channel-name]', function () {
         const config = providerConfigForKey(this.dataset.stscChannelName);
         if (!config) return;
@@ -1501,13 +1526,65 @@ function dualApiModelChoicesHtml(config, models, state, optionAttr) {
     return '<div class="stsc-empty stsc-model-list-empty">模型将自动获取</div>';
 }
 
+function perModelAttemptLimit(dual) {
+    return Math.round(clampNumber(dual?.perModelAttempts, 1, 2, 1));
+}
+
+function normalizeCandidatePriority(value) {
+    const seen = new Set();
+    return (Array.isArray(value) ? value : []).filter(item => {
+        if (!item || typeof item.channelKey !== 'string' || typeof item.model !== 'string') return false;
+        const key = JSON.stringify([item.channelKey, item.model]);
+        if (seen.has(key)) return false;
+        seen.add(key); return true;
+    }).map(({channelKey, model}) => ({channelKey, model}));
+}
+
+function orderedDualApiCandidates(dual) {
+    const all = getDualApiCandidates(dual);
+    const chosen = normalizeCandidatePriority(dual.candidatePriority).flatMap(item => {
+        const found = all.find(candidate => candidate.channelKey === item.channelKey && candidate.model === item.model);
+        return found ? [found] : [];
+    });
+    const used = new Set(chosen.map(item => JSON.stringify([item.channelKey, item.model])));
+    return chosen.concat(all.filter(item => item.modelIndex < item.maxAttempts && !used.has(JSON.stringify([item.channelKey, item.model]))));
+}
+
+function dualApiAttemptPlan(dual, singleAttempt = false) {
+    const models = orderedDualApiCandidates(dual);
+    if (singleAttempt || !dual.retryTransient) return models.slice(0, 1);
+    const counts = new Map();
+    return models.flatMap(model => Array.from({length: perModelAttemptLimit(dual)}, (_, i) => {
+        const channelAttempt = (counts.get(model.channelKey) || 0) + 1;
+        counts.set(model.channelKey, channelAttempt);
+        return {...model, channelAttempt, modelAttempt: i + 1};
+    }));
+}
+
+function candidatePriorityHtml(dual) {
+    const all = getDualApiCandidates(dual);
+    const priority = normalizeCandidatePriority(dual.candidatePriority);
+    const items = priority.map((item, index) => {
+        const candidate = all.find(c => c.channelKey === item.channelKey && c.model === item.model);
+        return '<div class="stsc-priority-row"><span>' + (index + 1) + '. ' + escapeHtml(candidate?.label || item.model + '（当前不可用，跳过）') + '</span>' +
+            '<button type="button" class="menu_button" data-priority-action="up" data-priority-index="'+index+'" '+(index===0?'disabled':'')+'>↑</button>' +
+            '<button type="button" class="menu_button" data-priority-action="down" data-priority-index="'+index+'" '+(index===priority.length-1?'disabled':'')+'>↓</button>' +
+            '<button type="button" class="menu_button" data-priority-action="remove" data-priority-index="'+index+'">取消</button></div>';
+    }).join('');
+    return '<div id="stsc_priority_config" class="stsc-api-group"><h4>1. 调用顺序</h4><div class="stsc-muted">优先项先执行，剩余候选按默认渠道与模型顺序。取消全部优先项即可恢复默认；每个候选只列一次。</div>' +
+        (items || '<div class="stsc-muted">未指定优先项，当前使用默认顺序。</div>') +
+        '<label for="stsc_priority_candidate">选择渠道 / 模型</label><select id="stsc_priority_candidate" class="text_pole"><option value="">请选择</option>' +
+        all.filter(c=>!priority.some(i=>i.channelKey===c.channelKey && i.model===c.model)).map(c=>'<option value="'+escapeHtml(JSON.stringify({channelKey:c.channelKey,model:c.model}))+'">'+escapeHtml(c.label)+'</option>').join('') +
+        '</select><div class="stsc-compact-row"><button class="menu_button" type="button" data-priority-action="add">加入优先列表</button><button class="menu_button" type="button" data-priority-action="clear">恢复默认顺序</button></div>' + dualApiExecutionOrderHtml(dual) + '</div>';
+}
+
 function channelAttemptLimit(config) {
     return Math.round(clampNumber(config?.maxAttempts, 1, 10, 2));
 }
 
 function channelPlannedModels(config) {
     const models = selectedDualApiModels(config);
-    return models.slice(0, channelAttemptLimit(config)).flatMap(model => [model, model]);
+    return models.slice(0, channelAttemptLimit(config)).flatMap(model => Array(perModelAttemptLimit(config)).fill(model));
 }
 
 const expandedApiChannelIds = new Set();
@@ -1623,21 +1700,14 @@ function dualApiChannelRoleHtml(dual, channelIndex) {
 }
 
 function dualApiExecutionOrderHtml(dual) {
-    const channels = orderedDualApiChannelConfigs(dual);
-    const parts = (dual.retryTransient ? channels : channels.filter(channel => normalizeDualApiBaseUrl(channel.endpoint, channel.provider) && selectedDualApiModels(channel).length).slice(0, 1))
-        .filter(channel => normalizeDualApiBaseUrl(channel.endpoint, channel.provider) && selectedDualApiModels(channel).length)
-        .map(channel => {
-            const models = (dual.retryTransient ? channelPlannedModels(channel) : selectedDualApiModels(channel).slice(0, 1)).map((model, index) => `${index + 1}.${model}`).join(' → ');
-            return `${channel.label}：${models}`;
-        });
-    if (!parts.length) return '<div id="stsc_dual_order" class="stsc-dual-order stsc-muted">当前还没有可执行的自检渠道。</div>';
-    return `<div id="stsc_dual_order" class="stsc-dual-order"><span class="stsc-muted">执行顺序：</span>${parts.map(part => `<span class="stsc-status-pill">${escapeHtml(part)}</span>`).join('')}</div>`;
+    const plan = dualApiAttemptPlan(dual);
+    return '<div id="stsc_dual_order" class="stsc-dual-order"><b>实际执行顺序</b>' + (plan.length ? plan.map((item,index)=>'<span class="stsc-status-pill">'+(index+1)+'. '+escapeHtml(item.label)+'</span>').join('') : '<span>暂无可用候选</span>') + '</div>';
 }
 
 function updateDualApiExecutionOrder() {
-    const element = document.getElementById('stsc_dual_order');
+    const element = document.getElementById('stsc_priority_config');
     const dual = getUiSettings()?.dualApi;
-    if (element && dual) element.outerHTML = dualApiExecutionOrderHtml(dual);
+    if (element && dual) element.outerHTML = candidatePriorityHtml(dual);
 }
 
 function dualApiModelOptionsHtml(dual) {
@@ -1689,7 +1759,7 @@ function dualApiFallbacksHtml(dual) {
         <details class="stsc-fallback-api-card" data-fallback-index="${index}" data-channel-id="${escapeHtml(item.id)}" ${expandedApiChannelIds.has(item.id) ? 'open' : ''}>
             <summary class="stsc-channel-summary">
                 <span class="stsc-channel-summary-title">${item.enabled !== false ? '●' : '○'} ${escapeHtml(channelDisplayName(item, index + 1))}${Number(dual.primaryIndex) === index + 1 ? ' · 主渠道' : ''}</span>
-                <span class="stsc-muted">${escapeHtml(getProvider(item).name)} · 前 ${channelAttemptLimit(item)} 个模型 · 每模型2次 · ${item.enabled !== false ? '已启用' : '已停用'}</span>
+                <span class="stsc-muted">${escapeHtml(getProvider(item).name)} · 前 ${channelAttemptLimit(item)} 个模型 · ${item.enabled !== false ? '已启用' : '已停用'}</span>
                 <span class="stsc-channel-summary-model">${escapeHtml(selectedDualApiModels(item)[0] || '未选择模型')}</span>
             </summary>
             <div class="stsc-channel-body">
@@ -1711,6 +1781,10 @@ function dualApiFallbacksHtml(dual) {
                     <input class="text_pole" type="text" autocomplete="off" data-dual-fallback-field="endpoint" placeholder="https://example.com/v1" value="${escapeHtml(item.endpoint)}">
                 </div>
                 <div class="stsc-field">
+                    <label>API密钥</label>
+                    <input class="text_pole" type="password" autocomplete="new-password" data-dual-fallback-field="apiKey" placeholder="sk-…" value="${escapeHtml(item.apiKey)}">
+                </div>
+                <div class="stsc-field">
                     <label>模型</label>
                     <input class="text_pole stsc-model-search" type="search" autocomplete="off" data-dual-fallback-model-search placeholder="搜索模型">
                     <div class="stsc-model-row">
@@ -1722,10 +1796,7 @@ function dualApiFallbacksHtml(dual) {
                     <div class="stsc-muted stsc-model-status ${fallbackModelState(item).error ? 'stsc-model-status-error' : ''} ${fallbackModelState(item).models.length && !fallbackModelState(item).error ? 'stsc-model-status-success' : ''}">${escapeHtml(dualApiFallbackModelStatusText(item))}</div>
                     <div class="stsc-dual-fallback-selected">${dualApiSelectedModelsHtml(item)}</div>
                 </div>
-                <div class="stsc-field">
-                    <label>API密钥</label>
-                    <input class="text_pole" type="password" autocomplete="new-password" data-dual-fallback-field="apiKey" placeholder="sk-…" value="${escapeHtml(item.apiKey)}">
-                </div>
+
             </div>
             </div>
         </details>
@@ -3047,6 +3118,7 @@ function channelDisplayName(config, index = 0) {
 
 function dualApiChannelConfigs(dual) {
     const channels = [{
+        channelKey: "primary",
         channelIndex: 0,
         label: channelDisplayName(dual),
         provider: providerId(dual.provider),
@@ -3062,6 +3134,7 @@ function dualApiChannelConfigs(dual) {
     fallbacks.forEach((item, index) => {
         if (!item || item.enabled === false) return;
         channels.push({
+            channelKey: item.id,
             channelIndex: index + 1,
             maxAttempts: channelAttemptLimit(item),
             provider: providerId(item.provider),
@@ -3095,6 +3168,7 @@ function getDualApiCandidates(dual) {
             candidates.push({
                 label: `${config.label} / ${model}`,
                 apiName: config.label,
+                channelKey: config.channelKey,
                 channelIndex: config.channelIndex,
                 maxAttempts: channelAttemptLimit(config),
                 provider: providerId(config.provider),
@@ -3166,6 +3240,9 @@ async function callDualApiCandidate(candidate, { chat, questions, references, te
         attempt.rawResponse = redactDetail(responseText);
         let payload;
         try { payload = JSON.parse(responseText); } catch { payload = { text: responseText }; }
+        if (payload?.promptFeedback?.blockReason || payload?.candidates?.[0]?.finishReason || payload?.choices?.[0]?.finish_reason === 'content_filter' || payload?.choices?.[0]?.message?.refusal) {
+            try { readGenerationText(payload); } catch (error) { if (error.code === 'safety_refusal') throw error; }
+        }
         const text = extractDualApiText(payload);
         attempt.extractedText = redactDetail(text);
         const failed = !response.ok || Boolean(payload?.error) || payload?.type === 'error';
@@ -3185,7 +3262,8 @@ async function callDualApiCandidate(candidate, { chat, questions, references, te
             throw error;
         }
         try { readGenerationText(payload); } catch (error) {
-            error.code = 'provider_failure'; error.explicitFailure = true; throw error;
+            if (error.code !== 'safety_refusal') { error.code = 'provider_failure'; error.explicitFailure = true; }
+            throw error;
         } // 原生供应商内容限制不作为有效自检答案。
         attempt.status = 'received';
         attempt.parsed = redactDetail(parseModelOutput(text, questions));
@@ -3212,16 +3290,7 @@ async function callDualApiCandidate(candidate, { chat, questions, references, te
 }
 
 async function callDualApiSelfCheck(args, { candidateLimit = 0, replay = false } = {}) {
-    const models = getDualApiCandidates(args.settings.dualApi);
-    const singleAttempt = candidateLimit === 1 || !args.settings.dualApi.retryTransient;
-    const channels = new Map();
-    for (const model of models) {
-        if (!channels.has(model.channelIndex)) channels.set(model.channelIndex, []);
-        channels.get(model.channelIndex).push(model);
-    }
-    const candidates = singleAttempt ? models.slice(0, 1) : [...channels.values()].flatMap(channel =>
-        channel.slice(0, channelAttemptLimit(channel[0])).flatMap((model, index) =>
-            [1, 2].map(modelAttempt => ({ ...model, modelAttempt, channelAttempt: index * 2 + modelAttempt }))));
+    const candidates = dualApiAttemptPlan(args.settings.dualApi, candidateLimit === 1);
     if (!candidates.length) throw new Error('尚未配置有效的自检API地址和模型。');
     const failures = [];
     let bestPartial = null;
@@ -3255,7 +3324,7 @@ async function callDualApiSelfCheck(args, { candidateLimit = 0, replay = false }
             updateDetailedRun({ failures });
             if (error.code === 'cancelled' || !error.explicitFailure || index + 1 >= candidates.length) {
                 error.failedApis = failures;
-                if (bestPartial && error.code !== 'cancelled') {
+                if (bestPartial && !['cancelled', 'safety_refusal'].includes(error.code)) {
                     updateDetailedRun({ decision: 'retain_partial_after_failure', selectedApi: bestPartial.apiLabel });
                     return partialResult(index + 1);
                 }
@@ -4208,7 +4277,7 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
             const reason = dualApiFailureMessage(error);
             const character = runtimeCharacterLabel({ characterName: getCurrentEntity()?.name || '' });
             if (error.code === 'cancelled' || pendingRun !== currentRun) { abort?.(true); return; }
-            if (settings.dualApi.failureMode === 'stop') {
+            if (settings.dualApi.failureMode === 'stop' || error.code === 'safety_refusal') {
                 updateDetailedRun({ status: 'failed', decision: 'stop_generation', error: error.message });
                 markReviewerMainStatus('stopped');
                 pendingRun = null;
@@ -4509,7 +4578,7 @@ function renderQuestionCards(preset) {
             <div class="stsc-question-body stsc-collapsible-body">
                 <div class="stsc-field">
                     <label>问题内容</label>
-                    <textarea class="text_pole stsc-textarea" data-question-field="text">${escapeHtml(question.text)}</textarea>
+                    <textarea class="text_pole stsc-textarea stsc-question-editor" rows="14" data-question-field="text">${escapeHtml(question.text)}</textarea>
                 </div>
                 <div class="stsc-field" style="margin-top:9px">
                     <label>主模型交接题意（可选）</label>
@@ -4872,20 +4941,30 @@ function renderSettingsTab() {
             <div class="stsc-dev-notice">
                 双API核心流程已启用：每次生成会先消耗一次自检API调用，再把自检结果临时交给酒馆主API生成正文。可选择开启上一轮复盘和强力规范。
             </div>
-            ${dualApiExecutionOrderHtml(dual)}
+            ${candidatePriorityHtml(dual)}
 
+            <h4>2. 渠道配置</h4>
+            <details class="stsc-primary-api-card stsc-api-group" data-channel-id="primary" ${expandedApiChannelIds.has("primary") ? "open" : ""}><summary><b>${escapeHtml(channelDisplayName(dual))}</b> · ${escapeHtml(selectedDualApiModels(dual)[0] || "未选择模型")} · 点击配置</summary>
             <div class="stsc-grid-2" style="margin-top:12px">
                 <div class="stsc-field">
+                    ${providerControlsHtml(dual, "primary")}
                     <div class="stsc-channel-label-row">
                         <label>自检API接口地址</label>
-                    ${providerControlsHtml(dual, "primary")}
                         ${dualApiChannelRoleHtml(dual, 0)}
                     </div>
                     <input id="stsc_dual_endpoint" class="text_pole" type="text" autocomplete="off" placeholder="例如：https://example.com/v1" value="${escapeHtml(dual.endpoint)}">
-                    <div class="stsc-muted">保留供应商提供的完整基础路径（包括Plan路径）；第三方OpenAI兼容中转请选择自定义。</div>
+                    <div class="stsc-muted">填写供应商提供的完整基础地址。</div>
+<div class="stsc-field" style="margin-top:10px">
+                <label>API密钥</label>
+                <div class="stsc-secret-row">
+                    <input id="stsc_dual_api_key" class="text_pole" type="password" autocomplete="new-password" placeholder="sk-…" value="${escapeHtml(dual.apiKey)}">
+                    <button id="stsc_toggle_api_key" class="menu_button stsc-small-button" type="button">显示</button>
+                </div>
+                <div class="stsc-muted">密钥保存在当前酒馆的插件设置中，不会写入导出的预设或资料库文件。</div>
+            </div>
                 </div>
                 <div class="stsc-field">
-                    <label>自检模型</label>
+                    <h4>模型选择与顺序</h4>
                     <input class="text_pole stsc-model-search" type="search" autocomplete="off" data-dual-model-search="primary" placeholder="搜索模型">
                     <div class="stsc-model-row">
                         <div id="stsc_dual_model" class="stsc-model-choice-list ${normalizeDualApiBaseUrl(dual.endpoint, dual.provider) && !dualApiModelsLoading ? '' : 'is-disabled'}">
@@ -4895,19 +4974,11 @@ function renderSettingsTab() {
                     </div>
                     <div id="stsc_dual_model_status" class="stsc-muted stsc-model-status ${dualApiModelsError ? 'stsc-model-status-error' : ''} ${dualApiModels.length && !dualApiModelsError ? 'stsc-model-status-success' : ''}">${escapeHtml(dualApiModelStatusText(dual))}</div>
                     <div id="stsc_dual_model_selected">${dualApiSelectedModelsHtml(dual)}</div>
-                    <div class="stsc-muted">可手填模型ID或手动刷新列表；刷新不覆盖已选模型。按已选模型顺序尝试，达到此渠道的次数上限后换备用渠道；次数可为每个渠道单独设置。</div>
+                    <div class="stsc-muted">可手填模型ID或手动刷新列表；刷新不覆盖已选模型。按已选模型顺序尝试，每个渠道可单独设置参与的模型数量；指定的跨渠道优先项先执行。</div>
                 </div>
             </div>
 
-            <div class="stsc-field" style="margin-top:10px">
-                <label>API密钥</label>
-                <div class="stsc-secret-row">
-                    <input id="stsc_dual_api_key" class="text_pole" type="password" autocomplete="new-password" placeholder="sk-…" value="${escapeHtml(dual.apiKey)}">
-                    <button id="stsc_toggle_api_key" class="menu_button stsc-small-button" type="button">显示</button>
-                </div>
-                <div class="stsc-muted">密钥保存在当前酒馆的插件设置中，不会写入导出的预设或资料库文件。</div>
-            </div>
-
+            </details>
             <div class="stsc-field" style="margin-top:12px">
                 <div class="stsc-section-title stsc-section-title-row">
                     <span>备用自检API</span>
@@ -4919,6 +4990,7 @@ function renderSettingsTab() {
                 </div>
             </div>
 
+            <details class="stsc-api-group" data-channel-id="generation-options" ${expandedApiChannelIds.has("generation-options") ? "open" : ""}><summary><b>3. 自检参数与失败处理</b> · 每模型${perModelAttemptLimit(dual)}次 · ${dual.failureMode === "stop" ? "失败停止" : "主模型接管"}</summary>
             <div class="stsc-grid-3" style="margin-top:10px">
                 <div class="stsc-field">
                     <label>自检最大回复长度</label>
@@ -4948,9 +5020,9 @@ function renderSettingsTab() {
                     <div class="stsc-muted">单位：秒，默认120秒，可调至600秒。流式每收到有效数据会重新计时，不限制总生成时长；超时或断网不重发，执行下方失败处理。非流式则是完整响应等待时限。</div>
                 </div>
                 <div class="stsc-field">
-                    <label>失败重试与渠道切换</label>
-                    <label class="checkbox_label"><input id="stsc_dual_retry_transient" type="checkbox" ${dual.retryTransient ? 'checked' : ''}> 明确失败或回答不完整时，每模型最多尝试2次，再按顺序切换</label>
-                    <div class="stsc-muted">每个渠道默认尝试前2个模型，每模型最多2次；可独立调整参与模型数量。关闭后总计只请求一次；超时、断网、异常断流不追加调用。</div>
+                    <label>每模型最多调用次数</label><select id="stsc_per_model_attempts" class="text_pole"><option value="1" ${perModelAttemptLimit(dual)===1?'selected':''}>1次（默认）</option><option value="2" ${perModelAttemptLimit(dual)===2?'selected':''}>2次</option></select><label>失败重试与渠道切换</label>
+                    <label class="checkbox_label"><input id="stsc_dual_retry_transient" type="checkbox" ${dual.retryTransient ? 'checked' : ''}> 普通接口失败或回答不完整时，继续下一候选</label>
+                    <div class="stsc-muted">每模型默认只调用1次。关闭候选切换后总计只请求一次；超时、断网、异常断流和供应商安全拦截不自动继续。</div>
                 </div>
             </div>
 
@@ -4989,7 +5061,7 @@ function renderSettingsTab() {
                         <option value="fallback_single" ${dual.failureMode !== 'stop' ? 'selected' : ''}>交给酒馆主模型自检并继续正文</option>
                         <option value="stop" ${dual.failureMode === 'stop' ? 'selected' : ''}>停止本轮生成，不调用酒馆主模型</option>
                     </select>
-                    <div class="stsc-muted">全部渠道明确失败，或超时、断网时执行此选项。正常结束但回答不完整时先按顺序重试；仍未完成则保留完成度最高的一整份答案。接管模式交给主模型补题，停止模式不生成正文。</div>
+                    <div class="stsc-muted">全部渠道普通接口失败，或超时、断网时执行此选项。明确安全拒答始终停止本轮，不再调用其他模型。正常结束但回答不完整时先按顺序重试；仍未完成则保留完成度最高的一整份答案。接管模式交给主模型补题，停止模式不生成正文。</div>
                 </div>
                 <div class="stsc-dual-library-note">
                     <b>资料库在双API模式下</b>
@@ -5000,6 +5072,7 @@ function renderSettingsTab() {
                 <button class="menu_button" type="button" data-action="test-dual-api-self-check">测试首选自检模型（不生成正文）</button>
                 <span class="stsc-muted">只调用首选模型一次，回放当前聊天最近一次真实主请求；不加入新正文或输入框内容。</span>
             </div>
+            </details>
         </div>
 
         ${testResultSectionHtml()}

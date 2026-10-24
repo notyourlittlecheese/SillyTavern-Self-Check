@@ -128,7 +128,7 @@ test('response parsing uses final text only for all three protocols', () => {
     assert.equal(extractResponseText({ candidates: [{ content: { parts: [{ thought: true, text: 'private' }, { text: 'final' }] } }] }), 'final');
     assert.equal(extractResponseText({ content: { arbitrary: 'object' } }), '');
     assert.throws(() => readGenerationText({ choices: [] }), /最终文本/);
-    assert.throws(() => readGenerationText({ promptFeedback: { blockReason: 'SAFETY' } }), /未返回可用文本/);
+    assert.throws(() => readGenerationText({ promptFeedback: { blockReason: 'SAFETY' } }), /安全策略拒绝/);
 });
 
 test('errors are short and never echo secrets/prompts/provider HTML', async () => {
@@ -220,4 +220,30 @@ test('SSE parser distinguishes explicit errors from uncertain disconnects and ti
 test('native completion markers finish Gemini and Claude streams without OpenAI DONE', async () => {
     assert.equal((await streamFixture('data: {"candidates":[{"content":{"parts":[{"text":"G"}]},"finishReason":"STOP"}]}\n\n')).text,'G');
     assert.equal((await streamFixture('data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"C"}}\n\ndata: {"type":"message_stop"}\n\n')).text,'C');
+});
+
+
+test('heartbeat followed by bare relay error is explicit failure rather than missing DONE', async () => {
+    const body=JSON.stringify({error:{message:'Please try again later',type:'new_api_error',code:'bad_response'}});
+    for(const separator of ['\n\n','\n']) {
+        await assert.rejects(streamFixture(': PING'+separator+body,{bytewise:true}),e=>e.code==='provider_failure' && e.explicitFailure && e.rawResponse.includes('bad_response'));
+    }
+    await assert.rejects(streamFixture(': PING\n\n{"error":{"message":"upstream timeout"}}'),e=>e.code==='timeout' && !e.explicitFailure);
+    await assert.rejects(streamFixture(': PING\n\n{"error":'),e=>e.code==='stream_interrupted' && !e.explicitFailure);
+});
+
+test('explicit safety refusals are terminal in JSON and streamed responses', async () => {
+    const {readGenerationText,isExplicitSafetyRefusal}=await import('../api-providers.mjs');
+    for(const payload of [
+        {choices:[{message:{content:'partial'},finish_reason:'content_filter'}]},
+        {choices:[{message:{refusal:'Blocked by policy'}}]},
+        {candidates:[{finishReason:'SAFETY'}]},
+        {promptFeedback:{blockReason:'SAFETY'}},
+        {choices:[{message:{content:'I cannot fulfill this request. My safety guidelines prohibit this content.'}}]},
+    ]) {
+        assert.throws(()=>readGenerationText(payload),e=>e.code==='safety_refusal'&&!e.explicitFailure);
+        await assert.rejects(streamFixture('data: '+JSON.stringify(payload)+'\n\ndata: [DONE]\n\n'),e=>e.code==='safety_refusal');
+    }
+    assert.equal(isExplicitSafetyRefusal('<stsc_self_check><answer>I cannot fulfill this request because safety guidelines prohibit it.</answer></stsc_self_check>'),false);
+    assert.equal(isExplicitSafetyRefusal('I cannot provide a connection because the server is down.'),false);
 });
