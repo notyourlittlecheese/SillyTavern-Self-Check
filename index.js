@@ -1,10 +1,10 @@
-import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider, buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText, readGenerationText, providerError, requestProvider, testConnection, readSelfCheckStream, readSelfCheckResponse, SELF_CHECK_PARSER_VERSION } from './api-providers.mjs?v=0.4.31';
+import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider, buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText, readGenerationText, providerError, requestProvider, testConnection, readSelfCheckStream, readSelfCheckResponse, SELF_CHECK_PARSER_VERSION } from './api-providers.mjs?v=0.4.32';
 
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
 const STSC_REVIEWER_META_KEY = 'sillytavern_self_check_reviewer_latest';
-const STSC_VERSION = '0.4.31';
+const STSC_VERSION = '0.4.32';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 10;
@@ -41,11 +41,11 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-11-03',
-    title: '复用上次自检结果',
+    title: '复用前逐次确认',
     changes: Object.freeze([
-        "双API模式新增复用开关：跳过自检API，重新注入当前聊天上次保存的问题与答案。",
-        "正文失败或停止后仍可复用；无可用记录时停止，不自动产生自检调用。",
-        "保存原问题快照避免预设切换错配；日志记录复用来源，本轮自检调用数为0。"
+        "仅在勾选复用时，每次生成前确认；确认完成前不调用API。",
+        "选是复用上次结果；选否取消勾选并保存，此后正常自检，直到再次手动开启。",
+        "关闭弹窗或等待期间停止生成、切换聊天，不继续请求。"
 ]),
 });
 
@@ -179,6 +179,7 @@ let runtimePromptKeys = new Set();
 let initialized = false;
 let bulkDraft = null;
 let editDraft = null;
+let reuseConfirmation = null;
 let editDirty = false;
 let pendingUnsavedAction = null;
 let floatingDragState = null;
@@ -4187,6 +4188,7 @@ function onGenerationEnded() {
 }
 
 function onGenerationStopped() {
+    if (reuseConfirmation) reuseConfirmation.cancelled = true;
     activeDualController?.abort('user');
     updateDetailedRun({ status: 'stopped' });
     markReviewerMainStatus('stopped');
@@ -4204,11 +4206,39 @@ function skipGenerationType(type) {
     return value === 'quiet' || value === 'dryrun' || value === 'dry_run';
 }
 
+async function confirmSelfCheckReuse(settings) {
+    const context = ctx();
+    const token = { chatId: getCurrentChatId(), cancelled: false };
+    reuseConfirmation = token;
+    try {
+        const result = await context.callGenericPopup(
+            '<h3>本轮是否复用上次自检结果？</h3><p>是：不请求自检API，直接使用当前聊天上次的结果。</p><p>否：关闭复用开关，本轮正常调用自检API。</p>',
+            context.POPUP_TYPE.CONFIRM, '', { okButton: '是，复用', cancelButton: '否，重新自检' });
+        if (token.cancelled || token.chatId !== getCurrentChatId()) return false;
+        if (result === context.POPUP_RESULT.AFFIRMATIVE) return true;
+        if (result !== context.POPUP_RESULT.NEGATIVE) return false;
+        settings.reuseLastSelfCheck = false;
+        if (editDraft) editDraft.reuseLastSelfCheck = false;
+        saveSettings();
+        renderAll();
+        return true;
+    } catch (error) {
+        console.error('[STSC] 复用确认失败：', error);
+        toastr.warning('未完成复用确认，已停止本轮生成。', '墨提斯之镜');
+        return false;
+    } finally {
+        if (reuseConfirmation === token) reuseConfirmation = null;
+    }
+}
+
 globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize, abort, type) {
     const settings = normalizeSettings();
     if (!settings?.enabled || skipGenerationType(type)) return;
 
-    if (dualApiBusy || testBusy || providerConnectionBusy || pendingRun) { abort?.(true); return; }
+    if (dualApiBusy || testBusy || providerConnectionBusy || pendingRun || reuseConfirmation) { abort?.(true); return; }
+    if (settings.mode === 'dual_api' && settings.reuseLastSelfCheck && !await confirmSelfCheckReuse(settings)) {
+        abort?.(true); return;
+    }
     beginDetailedRun('generation');
     const context = ctx();
     const questions = getActiveQuestions(settings);
@@ -4979,7 +5009,7 @@ function renderSettingsTab() {
                 双API核心流程已启用：每次生成会先消耗一次自检API调用，再把自检结果临时交给酒馆主API生成正文。可选择开启上一轮复盘和强力规范。
             </div>
             <label class="checkbox_label"><input id="stsc_reuse_last_self_check" type="checkbox" ${settings.reuseLastSelfCheck ? 'checked' : ''}> 复用上次自检结果</label>
-            <div class="stsc-muted">开启后不请求自检API，使用当前聊天上次保存的问题与答案（包括正文失败或停止前的结果）。保持开启直到手动关闭；换新剧情时请关闭。没有可用记录则停止，不自动重新自检。</div>
+            <div class="stsc-muted">开启后不请求自检API，使用当前聊天上次保存的问题与答案（包括正文失败或停止前的结果）。每次生成前弹窗确认；选“否”关闭复用并正常自检，选“是”直接复用。没有可用记录则停止，不自动重新自检。</div>
             ${candidatePriorityHtml(dual)}
 
             <h4>2. 渠道配置</h4>

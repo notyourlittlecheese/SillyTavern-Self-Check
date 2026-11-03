@@ -13,7 +13,7 @@ function harness() {
         endpoint: 'https://example.test/v1', apiKey: 'private-test-key', models: ['first', 'second', 'third'],
         fallbacks: [], perModelAttempts: 2, timeoutSeconds: 120, maxTokens: 4096, retryTransient: true, contextMode: 'recent5',
     } };
-    const context = { chat: [{ is_user: true, mes: 'request' }], chatId: 'chat-a', extensionSettings: { sillytavern_self_check: settings }, setExtensionPrompt() {} };
+    const context = { chat: [{ is_user: true, mes: 'request' }], chatId: 'chat-a', callGenericPopup: async () => 1, POPUP_TYPE: {CONFIRM: 1}, POPUP_RESULT: {AFFIRMATIVE: 1, NEGATIVE: 0}, extensionSettings: { sillytavern_self_check: settings }, setExtensionPrompt() {} };
     const scope = vm.createContext({
         ...adapters,
         console: { warn() {}, error() {}, info() {} }, structuredClone, AbortController, URL, Blob,
@@ -1087,5 +1087,35 @@ test('legacy results reconstruct original questions and incomplete reuse respect
         await h.run("sillyTavernSelfCheckInterceptor([],0,stop,'continue')");
         assert.equal(h.calls.length,calls);assert.equal(stopped,failureMode==='stop');
         if(!stopped) {assert.equal(h.run('pendingRun.supplementQuestions.length'),1);assert.equal(h.run('pendingRun.dualParsed.answers[0].answer'),'Keep');}
+    }
+});
+
+test('reuse confirmation waits before any request and No persists off for later generations', async () => {
+    const h=harness();h.settings.reuseLastSelfCheck=true;
+    let resolveChoice, prompts=0, saves=0;
+    h.context.callGenericPopup=()=>{prompts++;return new Promise(resolve=>{resolveChoice=resolve;});};
+    h.context.saveSettingsDebounced=()=>{saves++;};
+    h.run('editDraft=structuredClone(settings)');h.mock(()=>h.response(200,{text:h.good}));
+    const pending=h.run("sillyTavernSelfCheckInterceptor([],0,()=>{},'continue')");
+    assert.equal(h.calls.length,0);assert.equal(h.run('pendingRun'),null);
+    resolveChoice(0);await pending;
+    assert.equal(h.calls.length,1);assert.equal(h.settings.reuseLastSelfCheck,false);
+    assert.equal(h.run('editDraft.reuseLastSelfCheck'),false);assert.equal(saves,1);
+    h.run('onGenerationStopped()');
+    await h.run("sillyTavernSelfCheckInterceptor([],0,()=>{},'normal')");
+    assert.equal(h.calls.length,2);assert.equal(prompts,1);
+});
+
+test('reuse confirmation dismissal, stop or chat switch never sends a request', async () => {
+    for(const action of ['dismiss','stop','chat']) {
+        const h=harness();h.settings.reuseLastSelfCheck=true;
+        let resolveChoice,stopped=false;
+        h.context.callGenericPopup=()=>new Promise(resolve=>{resolveChoice=resolve;});
+        h.scope.stop=()=>{stopped=true;};h.mock(()=>h.response(200,{text:h.good}));
+        const pending=h.run("sillyTavernSelfCheckInterceptor([],0,stop,'normal')");
+        if(action==='stop')h.run('onGenerationStopped()');
+        if(action==='chat')h.context.chatId='other';
+        resolveChoice(action==='dismiss'?null:0);await pending;
+        assert.equal(h.calls.length,0);assert.equal(stopped,true);assert.equal(h.settings.reuseLastSelfCheck,true);
     }
 });
