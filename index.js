@@ -1,10 +1,10 @@
-import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider, buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText, readGenerationText, providerError, requestProvider, testConnection, readSelfCheckStream, readSelfCheckResponse, SELF_CHECK_PARSER_VERSION } from './api-providers.mjs?v=0.4.30';
+import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider, buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText, readGenerationText, providerError, requestProvider, testConnection, readSelfCheckStream, readSelfCheckResponse, SELF_CHECK_PARSER_VERSION } from './api-providers.mjs?v=0.4.31';
 
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
 const STSC_REVIEWER_META_KEY = 'sillytavern_self_check_reviewer_latest';
-const STSC_VERSION = '0.4.30';
+const STSC_VERSION = '0.4.31';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 10;
@@ -40,13 +40,12 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-10-24',
-    title: '调用排序与清晰的失败诊断',
+    releasedAt: '2026-11-03',
+    title: '复用上次自检结果',
     changes: Object.freeze([
-        "明确安全拒答单独提示并停止本轮，不重试、不切换、不交给主模型。",
-        "支持跨渠道模型优先列表，取消后恢复默认排序；每模型默认调用一次，可选两次。",
-        "API设置分组折叠，预设完整问题编辑框加大。",
-        "修复心跳后直接返回中转JSON错误的识别。"
+        "双API模式新增复用开关：跳过自检API，重新注入当前聊天上次保存的问题与答案。",
+        "正文失败或停止后仍可复用；无可用记录时停止，不自动产生自检调用。",
+        "保存原问题快照避免预设切换错配；日志记录复用来源，本轮自检调用数为0。"
 ]),
 });
 
@@ -93,6 +92,7 @@ const ROLE_MAP = Object.freeze({
 });
 
 const DEFAULT_SETTINGS = Object.freeze({
+    reuseLastSelfCheck: false,
     enabled: true,
     mode: 'single',
     generalEnabled: true,
@@ -628,6 +628,7 @@ function normalizeSettings() {
     settings.dualApi.maxTokens = clampNumber(settings.dualApi.maxTokens, 256, 12000, 4096);
     settings.dualApi.timeoutSeconds = clampNumber(settings.dualApi.timeoutSeconds, 120, 600, 120);
     settings.dualApi.maxAttempts = channelAttemptLimit(settings.dualApi);
+    settings.reuseLastSelfCheck = settings.reuseLastSelfCheck === true;
     settings.dualApi.perModelAttempts = perModelAttemptLimit(settings.dualApi);
     settings.dualApi.candidatePriority = normalizeCandidatePriority(settings.dualApi.candidatePriority);
     settings.dualApi.retryTransient = Boolean(settings.dualApi.retryTransient);
@@ -1390,6 +1391,10 @@ async function testProviderChannel(key) {
 
 function bindProviderControls() {
     const overlay = $('#stsc_manager_overlay');
+    overlay.on('change', '#stsc_reuse_last_self_check', function () {
+        getUiSettings().reuseLastSelfCheck = this.checked;
+        markDirty();
+    });
     overlay.on('click', '[data-priority-action]', function () {
         const dual = getUiSettings().dualApi;
         const items = normalizeCandidatePriority(dual.candidatePriority);
@@ -3973,7 +3978,7 @@ function makeLatestResult({ parsed, questions, mode, messageId, rawOverride = ''
             apiName: String(dualApiResult.apiName || '').trim(),
             model: String(dualApiResult.model || '').trim(),
             providerWarning: String(dualApiResult.providerWarning || '').trim(),
-            attempts: Math.max(1, Number(dualApiResult.attempts) || 1),
+            attempts: dualApiResult.reusedFrom ? 0 : Math.max(1, Number(dualApiResult.attempts) || 1),
             compact: Boolean(dualApiResult.compact),
             failedApis: Array.isArray(dualApiResult.failedApis) ? dualApiResult.failedApis : [],
         }
@@ -3993,6 +3998,8 @@ function makeLatestResult({ parsed, questions, mode, messageId, rawOverride = ''
         recoveryNotes: parsed.recoveryNotes || [],
         rawCheck: rawOverride || parsed.rawCheck || '',
         answers: parsed.answers || [],
+        questions: clone(questions),
+        reusedFrom: dualApiResult?.reusedFrom || null,
         expectedCount: questions.length,
         answeredCount: (parsed.answers || []).filter(x => x.answer?.trim()).length,
         generalPresetName: settings.generalEnabled ? getPresetById(settings.generalPresetId)?.name || '' : '',
@@ -4009,6 +4016,30 @@ async function saveReviewerResult(parsed, questions, rawCheck, dualApiResult, pr
     latest.previousReview = previousReview;
     await saveLatestResult(latest);
     renderAll();
+}
+
+function reusableSelfCheck() {
+    const latest = getLatestResult();
+    if (!latest || latest.chatId !== getCurrentChatId() || latest.mode !== 'dual_api'
+        || !latest.answers?.some(answer => answer.answer?.trim())) {
+        const error = new Error('当前聊天没有可复用的外部自检结果。请关闭“复用上次自检结果”后重新生成。');
+        error.code = 'reuse_unavailable';
+        throw error;
+    }
+    // Keep the original question/answer pairing, including after a preset change.
+    const currentQuestions = getDualApiQuestions(normalizeSettings());
+    const questions = clone(latest.questions?.length ? latest.questions : latest.answers.map(answer => {
+        const current = currentQuestions.find(q => q.id === answer.id && q.text === answer.question);
+        return {...(current || {}), id: answer.id, text: answer.question || '', type: answer.type || 'open', requireEvidence: Boolean(answer.requireEvidence)};
+    }));
+    return {
+        questions,
+        parsed: {status: latest.status === 'dual_ok' ? 'ok' : latest.status, answers: clone(latest.answers),
+            rawCheck: latest.rawCheck || '', formatIssues: clone(latest.formatIssues || []), recoveryNotes: clone(latest.recoveryNotes || [])},
+        response: {text: latest.rawCheck || '', apiLabel: latest.dualApiSource?.label || '上次自检',
+            apiName: latest.dualApiSource?.apiName || '', model: latest.dualApiSource?.model || '', attempts: 0,
+            reusedFrom: {runId: latest.runId || '', timestamp: latest.timestamp}},
+    };
 }
 
 function markReviewerMainStatus(status) {
@@ -4188,7 +4219,7 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
     applyReferencePrompts(references);
     applyTemporaryPrompt(temporaryInstructions, settings.injection);
 
-    if (!questions.length) {
+    if (!questions.length && !(settings.mode === 'dual_api' && settings.reuseLastSelfCheck)) {
         pendingRun = null;
         return;
     }
@@ -4224,10 +4255,11 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
         }
         dualApiBusy = true;
         try {
-            const dualQuestions = getDualApiQuestions(settings);
-            const reviewExpected = Boolean(getReviewSource(settings));
+            const reused = settings.reuseLastSelfCheck ? reusableSelfCheck() : null;
+            const dualQuestions = reused?.questions || getDualApiQuestions(settings);
+            const reviewExpected = !reused && Boolean(getReviewSource(settings));
             pendingRun.questions = clone(dualQuestions);
-            const initialResponse = await callDualApiSelfCheck({
+            const initialResponse = reused?.response || await callDualApiSelfCheck({
                 chat: _chat,
                 questions: dualQuestions,
                 references,
@@ -4237,8 +4269,13 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
             if (pendingRun !== currentRun) { abort?.(true); return; }
             let dualApiResult = initialResponse;
             let rawCheck = initialResponse.text;
-            let dualParsed = parseModelOutput(rawCheck, dualQuestions);
-            let previousReview = parsePreviousReview(rawCheck);
+            let dualParsed = reused?.parsed || parseModelOutput(rawCheck, dualQuestions);
+            let previousReview = reused ? null : parsePreviousReview(rawCheck);
+            if (reused) {
+                updateDetailedRun({ reusedFrom: initialResponse.reusedFrom });
+                addRuntimeLog('info', '复用自检', '已复用当前聊天上次的自检问题和答案，本轮未调用自检API。', '仍会正常请求酒馆主模型生成正文；不会重新执行上一轮复盘。');
+                toastr.success('已复用上次自检结果，本轮不调用自检API。', '墨提斯之镜');
+            }
             await saveReviewerResult(dualParsed, dualQuestions, rawCheck, dualApiResult, previousReview);
             if (pendingRun !== currentRun) { abort?.(true); return; }
             const missing = dualParsedMissingRequirements(dualParsed, dualQuestions);
@@ -4277,7 +4314,7 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
             const reason = dualApiFailureMessage(error);
             const character = runtimeCharacterLabel({ characterName: getCurrentEntity()?.name || '' });
             if (error.code === 'cancelled' || pendingRun !== currentRun) { abort?.(true); return; }
-            if (settings.dualApi.failureMode === 'stop' || error.code === 'safety_refusal') {
+            if (settings.dualApi.failureMode === 'stop' || ['safety_refusal', 'reuse_unavailable'].includes(error.code)) {
                 updateDetailedRun({ status: 'failed', decision: 'stop_generation', error: error.message });
                 markReviewerMainStatus('stopped');
                 pendingRun = null;
@@ -4941,6 +4978,8 @@ function renderSettingsTab() {
             <div class="stsc-dev-notice">
                 双API核心流程已启用：每次生成会先消耗一次自检API调用，再把自检结果临时交给酒馆主API生成正文。可选择开启上一轮复盘和强力规范。
             </div>
+            <label class="checkbox_label"><input id="stsc_reuse_last_self_check" type="checkbox" ${settings.reuseLastSelfCheck ? 'checked' : ''}> 复用上次自检结果</label>
+            <div class="stsc-muted">开启后不请求自检API，使用当前聊天上次保存的问题与答案（包括正文失败或停止前的结果）。保持开启直到手动关闭；换新剧情时请关闭。没有可用记录则停止，不自动重新自检。</div>
             ${candidatePriorityHtml(dual)}
 
             <h4>2. 渠道配置</h4>

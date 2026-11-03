@@ -1041,3 +1041,51 @@ test('priority and per-model attempts survive preset binding and serialization',
     assert.equal(restored.dualApi.candidatePriority[0].model,'second');
     assert.equal(restored.presets.find(p=>p.id===restored.generalPresetId).apiConfig.dualApi.candidatePriority[0].model,'second');
 });
+
+test('reuse after stopped main generation makes no reviewer request and preserves original handoff', async () => {
+    const h=harness();h.context.chatMetadata={};
+    h.run("questions[0].handoffText='short question'");
+    h.mock(()=>h.response(200,{text:h.good}));
+    await h.run("sillyTavernSelfCheckInterceptor([],0,()=>{},'normal')");
+    const original=h.run('getLatestResult().runId');
+    h.run('onGenerationStopped()');
+    h.settings.reuseLastSelfCheck=true;
+    h.run("questions[0].text='changed preset question';questions[0].handoffText='changed handoff'");
+    await h.run("sillyTavernSelfCheckInterceptor([],0,()=>{throw Error('unexpected stop')},'continue')");
+    assert.equal(h.calls.length,1);
+    assert.equal(h.run('pendingRun.dualParsed.answers[0].answer'),'A');
+    assert.equal(h.run('pendingRun.questions[0].handoffText'),'short question');
+    assert.equal(h.run('getLatestResult().reusedFrom.runId'),original);
+    assert.equal(h.run('getLatestResult().dualApiSource.attempts'),0);
+    assert.equal(h.run('getLatestResult().mainGenerationStatus'),'pending');
+    assert.equal(h.run('pendingRun.previousReview'),null);
+    assert.equal(h.run('detailedRun.attempts.length'),0);
+    assert.equal(h.run("runtimePromptTexts.has('stsc_dual_main')"),true);
+    h.run('onGenerationStopped()');h.settings.reuseLastSelfCheck=false;
+    await h.run("sillyTavernSelfCheckInterceptor([],0,()=>{},'normal')");
+    assert.equal(h.calls.length,2);
+});
+
+test('reuse without a usable same-chat result stops without requesting reviewer or main fallback', async () => {
+    for(const latest of [null,{chatId:'other',mode:'dual_api',answers:[{answer:'wrong chat'}]},{chatId:'chat-a',mode:'dual_api',answers:[]}]) {
+        const h=harness();h.settings.reuseLastSelfCheck=true;h.context.chatMetadata={sillytavern_self_check_reviewer_latest:latest};
+        let stopped=false;h.scope.stop=()=>{stopped=true;};
+        h.mock(()=>{throw Error('must not call')});
+        await h.run("sillyTavernSelfCheckInterceptor([],0,stop,'continue')");
+        assert.equal(stopped,true);assert.equal(h.calls.length,0);assert.equal(h.run('pendingRun'),null);
+    }
+});
+
+test('legacy results reconstruct original questions and incomplete reuse respects failure policy', async () => {
+    for(const failureMode of ['stop','fallback_single']) {
+        const h=harness();h.context.chatMetadata={};h.settings.dualApi.failureMode='stop';
+        h.mock(()=>h.response(200,{text:'<stsc_self_check><item id="q1"><answer>Keep</answer></item></stsc_self_check>'}));
+        await h.run("sillyTavernSelfCheckInterceptor([],0,()=>{},'normal')");
+        h.run('delete getLatestResult().questions; pendingRun=null');
+        const calls=h.calls.length;h.settings.reuseLastSelfCheck=true;h.settings.dualApi.failureMode=failureMode;
+        let stopped=false;h.scope.stop=()=>{stopped=true;};
+        await h.run("sillyTavernSelfCheckInterceptor([],0,stop,'continue')");
+        assert.equal(h.calls.length,calls);assert.equal(stopped,failureMode==='stop');
+        if(!stopped) {assert.equal(h.run('pendingRun.supplementQuestions.length'),1);assert.equal(h.run('pendingRun.dualParsed.answers[0].answer'),'Keep');}
+    }
+});
