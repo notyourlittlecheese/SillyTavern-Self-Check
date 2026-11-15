@@ -2656,3 +2656,27 @@ body.stsc-modal-open {
 #stsc_manager_overlay .stsc-api-group .text_pole {max-width:100%;box-sizing:border-box;}
 #stsc_manager_overlay textarea.stsc-question-editor {min-height:320px;height:45vh;max-height:75vh;resize:vertical;line-height:1.6;}
 @media(max-width:600px){#stsc_manager_overlay textarea.stsc-question-editor{min-height:280px;height:48vh;}#stsc_manager_overlay .stsc-primary-api-card .stsc-grid-2{display:grid;grid-template-columns:1fr;}}
+
+/* Reference groups and plans, adapted from upstream v0.4.16. */
+.stsc-reference-group { min-width: 0; border: 1px solid var(--stsc-border); border-radius: 10px; overflow: hidden; }
+.stsc-reference-group-header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px; background: var(--stsc-panel-bg, rgba(128,128,128,.08)); }
+.stsc-reference-group-toggle { flex: 1 1 160px; min-width: 0; text-align: left; overflow-wrap: anywhere; color: inherit; background: transparent; border: 0; cursor: pointer; font: inherit; font-weight: 700; }
+.stsc-reference-group-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+.stsc-reference-group-content { display: grid; gap: 10px; padding: 10px; min-width: 0; }
+.stsc-reference-group-content[hidden] { display: none; }
+.stsc-reference-group-picker { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 0 12px 10px; font-size: .9em; }
+.stsc-reference-group-picker select { flex: 1 1 120px; min-width: 0; max-width: 100%; }
+.stsc-reference-group-filter { margin: 12px 0; }
+.stsc-reference-group-filter select { width: 100%; }
+.stsc-reference-plans { min-width: 0; }
+.stsc-reference-plans .stsc-field { margin: 12px 0; }
+.stsc-reference-plans .stsc-toolbar { flex-wrap: wrap; gap: 7px; margin: 10px 0; }
+.stsc-plan-entries { display: flex; flex-direction: column; gap: 9px; margin: 12px 0; }
+.stsc-plan-entry { min-width: 0; padding: 11px; border: 1px solid var(--stsc-border); border-radius: 10px; }
+.stsc-plan-entry > b { display: block; overflow-wrap: anywhere; margin-bottom: 8px; }
+.stsc-plan-entry-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.stsc-plan-entry-controls .checkbox_label { margin: 0; }
+.stsc-reference-plans .menu_button { white-space: normal; }
+
+
+[data-reference-source-row][hidden]{display:none}.stsc-reference-source-preview{white-space:pre-wrap}

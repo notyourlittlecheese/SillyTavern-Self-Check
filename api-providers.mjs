@@ -86,7 +86,7 @@ function validated(config, needsModel = false) {
 
 export function buildGenerationRequest(config, messages) {
     const { id, provider, endpoint, key, model } = validated(config, true);
-    const limit = Math.round(Math.min(12000, Math.max(256, Number(config.maxTokens) || 4096)));
+    const limit = Math.round(Math.min(12000, Math.max(256, Number(config.maxTokens) || 8192)));
     const common = { type: 'quiet', messages, model, stream: false };
     if (provider.protocol === 'claude') {
         return { ...common, chat_completion_source: 'claude', reverse_proxy: endpoint,

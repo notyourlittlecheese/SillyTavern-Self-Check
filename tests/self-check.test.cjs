@@ -23,7 +23,7 @@ function harness() {
         clearTimeout(id) { timers.delete(id); }, settings,
     });
     vm.runInContext(source, scope);
-    vm.runInContext(`const realSaveDiagnostic = saveDiagnostic; const realNormalizeSettings = normalizeSettings; normalizeSettings = () => settings;
+    vm.runInContext(`const realGetActiveQuestions = getActiveQuestions; const realGetActiveReferences = getActiveReferences; const realGetDualApiQuestions = getDualApiQuestions; const realSaveDiagnostic = saveDiagnostic; const realNormalizeSettings = normalizeSettings; normalizeSettings = () => settings;
         saveDiagnostic = async () => {}; addRuntimeLog = () => {}; renderAll = () => {};
         getDualApiCharacterContext = () => 'card'; getReviewSource = () => null;
         selectedRepairDirectives = () => []; getCurrentEntity = () => ({ name: 'test', key: 'test' });
@@ -1118,4 +1118,145 @@ test('reuse confirmation dismissal, stop or chat switch never sends a request', 
         resolveChoice(action==='dismiss'?null:0);await pending;
         assert.equal(h.calls.length,0);assert.equal(stopped,true);assert.equal(h.settings.reuseLastSelfCheck,true);
     }
+});
+
+test('new token budget defaults to 8192 while saved explicit budgets remain intact', () => {
+    const h=harness();assert.equal(h.run('DEFAULT_SETTINGS.dualApi.maxTokens'),8192);
+    h.run('normalizeSettings=realNormalizeSettings;normalizeSettings()');assert.equal(h.settings.dualApi.maxTokens,4096);
+    delete h.settings.dualApi.maxTokens;h.run('normalizeSettings()');assert.equal(h.settings.dualApi.maxTokens,8192);
+});
+
+test('references default to reviewer-only, stay in reviewer context and do not add dual questions', () => {
+    const h=harness();h.run(`normalizeSettings=realNormalizeSettings;const s=normalizeSettings();
+        const r=createReference('rules','restriction');r.content='PRIVATE_LIBRARY_SENTINEL';r.addToCheck=true;s.references=[r];
+        getActiveReferences=realGetActiveReferences;getActiveQuestions=realGetActiveQuestions;getDualApiQuestions=realGetDualApiQuestions;
+        globalThis.selectedQuestions=getDualApiQuestions(s);
+        applyReferencePrompts(getActiveReferences(s));`);
+    assert.equal(h.run('runtimePromptTexts.size'),0);
+    assert.equal(h.run("selectedQuestions.some(q=>q.id.startsWith('ref_'))"),false);
+    const messages=h.run('buildDualApiMessages([],selectedQuestions,getActiveReferences(settings),[],settings)');
+    assert.ok(messages[0].content.includes('PRIVATE_LIBRARY_SENTINEL'));
+    assert.ok(messages[0].content.includes('资料参考独立于自检预设'));
+    assert.ok(messages[0].content.includes('置信度低'));
+    assert.ok(!messages[0].content.includes('必须明确复述'));
+    assert.ok(!messages.at(-1).content.includes('PRIVATE_LIBRARY_SENTINEL'));
+    h.run('settings.references[0].sendToMain=true; applyReferencePrompts(getActiveReferences(settings))');
+    assert.equal(h.run('runtimePromptTexts.size'),1);
+    h.run("settings.mode='single'; settings.references[0].sendToMain=false");
+    assert.equal(h.run("getActiveQuestions(settings).some(q=>q.id.startsWith('ref_'))"),false);
+});
+
+test('reference optional delivery flag survives export/import; legacy records default off', () => {
+    const h=harness();h.run(`const r=createReference('rules');r.content='text';r.sendToMain=true;
+        globalThis.referencePayload=makeReferenceExportPayload(r);globalThis.imported=validateImportedReferencePayload(JSON.parse(JSON.stringify(referencePayload))).references[0];`);
+    assert.equal(h.scope.imported.sendToMain,true);
+    h.run('delete referencePayload.reference.sendToMain;globalThis.oldImported=validateImportedReferencePayload(referencePayload).references[0]');
+    assert.equal(h.scope.oldImported.sendToMain,false);
+    h.run('referencePayload.reference.sendToMain="yes"');assert.throws(()=>h.run('validateImportedReferencePayload(referencePayload)'),/开关格式/);
+});
+
+test('reference groups reorder within group and deleting a group retains content and plan membership', () => {
+    const h=harness();h.run(`settings.references=['a','b','c'].map(id=>({...createReference(id),id,content:id}));normalizeReferenceGroups(settings);normalizeReferencePlans(settings);
+        const group=setReferenceGroupName('Group',null,settings);moveReferencesToGroup(['a','c'],group.id,settings);
+        globalThis.groupId=group.id; const plan=createReferencePlan('Plan',['a','c'],settings);
+        moveReferenceInGroup('c',-1,settings);`);
+    assert.deepEqual(Array.from(h.settings.references,r=>r.id),['c','b','a']);
+    h.run('deleteReferenceGroup(groupId,settings)');
+    assert.equal(h.settings.references.length,3);assert.ok(h.settings.references.every(r=>r.groupId===''));
+    assert.equal(h.settings.referencePlans[0].entries.length,2);
+    assert.throws(()=>h.run("setReferenceGroupName('默认分组',null,settings)"),/重名|同名|已存在/);
+});
+
+test('reference plans honor character override, default, entry ordering and empty plan isolation', () => {
+    const h=harness();h.context.characters=[{name:'Alice',avatar:'alice.png'}];h.context.characterId=0;
+    h.run(`settings.references=['a','b'].map(id=>({...createReference(id),id,content:id,enabled:false}));normalizeReferencePlans(settings);
+        globalThis.defaultPlan=createReferencePlan('Default',['a'],settings);settings.defaultReferencePlanId=defaultPlan.id;
+        globalThis.boundPlan=createReferencePlan('Bound',['b','a'],settings);bindReferencePlan(boundPlan.id,settings);`);
+    assert.deepEqual(Array.from(h.run('realGetActiveReferences(settings)'),r=>r.id),['b','a']);
+    h.context.groupId='group';assert.deepEqual(Array.from(h.run('realGetActiveReferences(settings)'),r=>r.id),['a']);
+    delete h.context.groupId;h.run('boundPlan.entries=[]');assert.equal(h.run('realGetActiveReferences(settings).length'),0);
+    h.run('deleteReferencePlan(boundPlan.id,settings)');assert.deepEqual(Array.from(h.run('realGetActiveReferences(settings)'),r=>r.id),['a']);
+});
+
+test('persona context expands active identity macros and honors explicit do-not-send', () => {
+    const h=harness();h.context.name1='UserName';h.context.powerUserSettings={persona_description:'Hello {{user}}'};
+    h.context.substituteParams=text=>text.replace('{{user}}','UserName');
+    assert.ok(h.run('getDualApiUserContext()').includes('Hello UserName'));
+    h.context.powerUserSettings.persona_description_position=9;
+    assert.ok(!h.run('getDualApiUserContext()').includes('Hello'));
+    h.context.powerUserSettings={persona_description:''};assert.ok(!h.run('getDualApiUserContext()').includes('Hello'));
+    const replay=h.run('buildDualApiMessages([],questions,[],[],settings,{replay:true})');
+    assert.ok(replay[0].content.includes('身份信息以真实主请求快照为准'));
+});
+
+test('world and preset source import select actual content without inheriting activation or modifying originals', () => {
+    const h=harness();const book={entries:{a:{content:'alpha',comment:'one',disable:true},b:{content:' ',comment:'empty'},c:{content:'charlie',key:['key']}}};
+    h.scope.book=book;const original=JSON.stringify(book);
+    const entries=h.run('readWorldReferenceEntries(book)');assert.equal(entries.length,2);assert.equal(entries[0].disabled,true);assert.equal(entries[1].name,'key');assert.equal(JSON.stringify(book),original);
+    h.context.chatCompletionSettings={prompts:[{identifier:'a',content:'preset text',name:'A'},{marker:true,content:'marker'}],prompt_order:[{character_id:100001,order:[{identifier:'a',enabled:false}]}]};
+    const preset=h.run('readCurrentPresetReferenceEntries(ctx())');assert.equal(preset.entries.length,1);assert.equal(preset.entries[0].disabled,true);
+    h.run(`editDraft=structuredClone(DEFAULT_SETTINGS);referenceSourceDialogState={entries:readWorldReferenceEntries(book),selected:new Set([0,1])};closeDialog=()=>{};renderReferencesTab=()=>{};markDirty=()=>{};confirmReferenceSourceImport();`);
+    assert.equal(h.run('editDraft.references.length'),2);
+    assert.equal(h.run('editDraft.references.every(r=>!r.enabled&&!r.addToCheck&&!r.sendToMain)'),true);
+});
+
+test('question sources are omitted from reviewer XML but preserved in UI records; compact adjudication retains priorities', () => {
+    const h=harness();h.run("questions[0].source='PRIVATE_PRESET_NAME'");
+    assert.ok(!h.run('buildQuestionXml(questions)').includes('PRIVATE_PRESET_NAME'));
+    assert.ok(!h.run('buildQuestionXml(questions)').includes('<source>'));
+    assert.equal(h.run('parseModelOutput('+JSON.stringify(h.good)+',questions).answers[0].source'),'PRIVATE_PRESET_NAME');
+    const prompt=h.run('buildDualApiAdjudicationPrompt()');
+    assert.ok(prompt.length<1400);for(const text of ['不是MUST','严重扭曲','mechanism_core','interpretation_layer','hard canon','模型惯用方案','不得借裁决整体降低'])assert.ok(prompt.includes(text));
+});
+
+test('self-check extraction preserves final markdown code fence and separate body code blocks', () => {
+    const h=harness();const text=h.good+'\n正文\n```js\nconsole.log(1)\n```';h.scope.wire=text;
+    assert.ok(h.run('parseModelOutput(wire,questions).body').endsWith('```'));
+    for(const wire of ['```xml\n'+h.good+'\n```','````xml\n'+h.good+'\n```js\nbody\n```\n````']) {
+        h.scope.wire=wire;assert.ok(h.run('normalizeModelXmlText(wire).source').startsWith('<stsc_self_check>'));
+    }
+    h.scope.wire='```js\n'+h.good+'\n```';assert.equal(h.run('normalizeModelXmlText(wire).source'),h.scope.wire);
+});
+
+test('live dual request uses reference as reviewer context while main injection only receives result', async () => {
+    const h=harness();h.context.chatMetadata={};
+    h.run(`normalizeSettings=realNormalizeSettings;const config=normalizeSettings();
+        config.references=[{...createReference('private constraints','restriction'),content:'REVIEWER_ONLY_RAW_RULE',addToCheck:true}];
+        getActiveReferences=realGetActiveReferences;`);
+    h.mock(()=>h.response(200,{text:h.good}));
+    await h.run("sillyTavernSelfCheckInterceptor([],0,()=>{},'normal')");
+    assert.equal(h.calls.length,1);assert.ok(h.calls[0].messages[0].content.includes('REVIEWER_ONLY_RAW_RULE'));
+    assert.equal(h.run("runtimePromptTexts.has('stsc_ref_'+settings.references[0].id)"),false);
+    assert.ok(!h.run("[...runtimePromptTexts.values()].join('\\n')").includes('REVIEWER_ONLY_RAW_RULE'));
+});
+
+test('library groups, plans, bindings and explicit body flag persist through settings serialization', () => {
+    const h=harness();h.run(`normalizeSettings=realNormalizeSettings;const persisted=normalizeSettings();
+        const ref={...createReference('Persisted'),content:'rules',sendToMain:true};persisted.references=[ref];
+        const group=setReferenceGroupName('G',null,persisted);moveReferencesToGroup([ref.id],group.id,persisted);
+        const plan=createReferencePlan('P',[ref.id],persisted);persisted.defaultReferencePlanId=plan.id;
+        globalThis.persistedCopy=JSON.parse(JSON.stringify(persisted));`);
+    h.context.extensionSettings.sillytavern_self_check=h.scope.persistedCopy;h.run('normalizeSettings()');
+    const restored=h.context.extensionSettings.sillytavern_self_check;
+    assert.equal(restored.referenceGroups[0].name,'G');assert.equal(restored.references[0].sendToMain,true);
+    assert.equal(restored.defaultReferencePlanId,restored.referencePlans[0].id);
+    assert.equal(restored.referencePlans[0].entries[0].referenceId,restored.references[0].id);
+});
+
+test('reference management dialogs render plans, grouping and world import with populated data', async () => {
+    const h=harness();const dialogs=[];
+    const chain=new Proxy({}, {get:(_,key)=>key==='length'?0:()=>chain});h.scope.$=()=>chain;
+    h.scope.document={getElementById:()=>null,querySelector:()=>null,querySelectorAll:()=>[]};
+    h.context.characters=[{name:'Alice',avatar:'alice.png'}];h.context.characterId=0;
+    h.context.getWorldInfoNames=()=>['Book'];h.context.loadWorldInfo=async()=>({entries:{1:{content:'Rule',comment:'Entry'}}});
+    h.scope.captureDialog=(...args)=>dialogs.push(args);
+    h.run(`openDialog=captureDialog;settings.references=[{...createReference('Rules'),content:'Rules text'}];normalizeReferenceGroups(settings);normalizeReferencePlans(settings);
+        renderReferencePlansDialog();openReferencePlanPicker();
+        createReferencePlan('Plan',[settings.references[0].id],settings);renderReferencePlansDialog();
+        openReferenceGroupDialog('new');openReferenceGroupDialog('move','');
+        openReferenceSourceDialog('world');`);
+    await h.run("selectReferenceSourceBook('0')");
+    assert.ok(dialogs.some(d=>d[1].includes('data-plan-action="bind"')));
+    assert.ok(dialogs.some(d=>d[1].includes('stsc_reference_group_name')));
+    assert.ok(dialogs.some(d=>d[1].includes('data-reference-source-entry="0"')));
 });

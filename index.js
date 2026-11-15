@@ -1,10 +1,10 @@
-import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider, buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText, readGenerationText, providerError, requestProvider, testConnection, readSelfCheckStream, readSelfCheckResponse, SELF_CHECK_PARSER_VERSION } from './api-providers.mjs?v=0.4.32';
+import { API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider, buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText, readGenerationText, providerError, requestProvider, testConnection, readSelfCheckStream, readSelfCheckResponse, SELF_CHECK_PARSER_VERSION } from './api-providers.mjs?v=0.4.33';
 
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
 const STSC_REVIEWER_META_KEY = 'sillytavern_self_check_reviewer_latest';
-const STSC_VERSION = '0.4.32';
+const STSC_VERSION = '0.4.33';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 10;
@@ -40,12 +40,14 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-11-03',
-    title: '复用前逐次确认',
+    releasedAt: '2026-11-15',
+    title: '自检资料内化与资料库管理',
     changes: Object.freeze([
-        "仅在勾选复用时，每次生成前确认；确认完成前不调用API。",
-        "选是复用上次结果；选否取消勾选并保存，此后正常自检，直到再次手动开启。",
-        "关闭弹窗或等待期间停止生成、切换聊天，不继续请求。"
+        "资料默认只供自检API参考，可逐份明确开启向正文发送原文；双API取消资料复述题，内置参考与疑似冲突提示。",
+        "精简主模型裁决提示词，保留事实优先级、创意机制与解释分离及原有交接逻辑。",
+        "新配置最大回复长度默认8192，现有配置可一键设为8192；保留手动保存值。",
+        "选择性整合原作者v0.4.16的资料分组、角色绑定资料方案、预设/世界书导入、User身份读取、来源字段精简与代码围栏保护。",
+        "保留本分支API候选排序、调用上限、失败停止/接管、短题意交接、复用确认和详细日志。"
 ]),
 });
 
@@ -112,7 +114,7 @@ const DEFAULT_SETTINGS = Object.freeze({
         models: [],
         primaryIndex: 0,
         fallbacks: [],
-        maxTokens: 4096,
+        maxTokens: 8192,
         timeoutSeconds: 120,
         maxAttempts: 2,
         retryTransient: true,
@@ -130,6 +132,10 @@ const DEFAULT_SETTINGS = Object.freeze({
     logLastViewedAt: 0,
     presets: [],
     references: [],
+    referenceGroups: [],
+    referencePlans: [],
+    referencePlanBindings: [],
+    defaultReferencePlanId: '',
     temporaryInstructions: [],
     pendingInstructionIds: [],
     persistentInstructionIds: [],
@@ -178,6 +184,10 @@ let internalQuietActive = false;
 let runtimePromptKeys = new Set();
 let initialized = false;
 let bulkDraft = null;
+const collapsedReferenceGroupIds = new Set();
+let referenceGroupFilter = null;
+let referencePlanDialogState = null;
+let referenceSourceDialogState = null;
 let editDraft = null;
 let reuseConfirmation = null;
 let editDirty = false;
@@ -626,7 +636,7 @@ function normalizeSettings() {
             };
         });
     settings.dualApi.primaryIndex = clampNumber(settings.dualApi.primaryIndex, 0, settings.dualApi.fallbacks.length, 0);
-    settings.dualApi.maxTokens = clampNumber(settings.dualApi.maxTokens, 256, 12000, 4096);
+    settings.dualApi.maxTokens = clampNumber(settings.dualApi.maxTokens, 256, 12000, 8192);
     settings.dualApi.timeoutSeconds = clampNumber(settings.dualApi.timeoutSeconds, 120, 600, 120);
     settings.dualApi.maxAttempts = channelAttemptLimit(settings.dualApi);
     settings.reuseLastSelfCheck = settings.reuseLastSelfCheck === true;
@@ -698,7 +708,7 @@ function normalizeSettings() {
     }
     if (!settings.migrations.dualApiReliabilityV1) {
         // beta.17：旧版默认 2000 Token 容易在 6～8 题时截断；只迁移旧默认值，保留用户主动设置的其他数值。
-        if (Math.round(settings.dualApi.maxTokens) === 2000) settings.dualApi.maxTokens = 4096;
+        if (Math.round(settings.dualApi.maxTokens) === 2000) settings.dualApi.maxTokens = 8192;
         settings.migrations.dualApiReliabilityV1 = true;
         settingsMigrated = true;
     }
@@ -787,6 +797,8 @@ function normalizeSettings() {
     }
 
     for (const reference of settings.references) normalizeReference(reference);
+    normalizeReferenceGroups(settings);
+    normalizeReferencePlans(settings);
     for (const instruction of settings.temporaryInstructions) normalizeTemporaryInstruction(instruction);
     const validInstructionIds = new Set(settings.temporaryInstructions.map(instruction => instruction.id));
     settings.persistentInstructionIds = [...new Set(settings.persistentInstructionIds.filter(id => validInstructionIds.has(id)))];
@@ -1206,6 +1218,8 @@ function createReference(name = '新参考资料', type = 'other') {
         position: config.position,
         depth: config.depth,
         role: config.role,
+        groupId: '',
+        sendToMain: false,
         addToCheck: false,
         autoQuestion: config.autoQuestion,
     };
@@ -1226,6 +1240,7 @@ function normalizeReference(reference) {
     reference.position = ['before', 'prompt', 'chat'].includes(reference.position) ? reference.position : defaults.position;
     reference.role = ['system', 'user', 'assistant'].includes(reference.role) ? reference.role : defaults.role;
     reference.depth = clampNumber(reference.depth, 0, 20, defaults.depth);
+    reference.sendToMain = reference.sendToMain === true;
     reference.addToCheck = Boolean(reference.addToCheck);
     reference.autoQuestion = String(reference.autoQuestion || defaults.autoQuestion);
 }
@@ -1390,7 +1405,67 @@ async function testProviderChannel(key) {
     }
 }
 
+function bindReferenceLibraryControls() {
+    $('#stsc_dialog_overlay').on('change', '#stsc_reference_source_kind', function () {
+        if (referenceSourceDialogState) openReferenceSourceDialog(this.value === 'world' ? 'world' : 'preset');
+    });
+
+    $('#stsc_dialog_overlay').on('change', '#stsc_reference_source_book', function () {
+        return selectReferenceSourceBook(this.value);
+    });
+
+    $('#stsc_dialog_overlay').on('change', '[data-reference-source-entry]', function () {
+        const state = referenceSourceDialogState;
+        const index = Number(this.dataset.referenceSourceEntry);
+        if (!state?.entries[index]) return;
+        if (this.checked) state.selected.add(index);
+        else state.selected.delete(index);
+        $('#stsc_reference_source_count').text(`已选择 ${state.selected.size} 条`);
+        $('#stsc_dialog_footer [data-dialog-action="confirm-reference-source"]').prop('disabled', !state.selected.size);
+    });
+
+    $('#stsc_dialog_overlay').on('input', '#stsc_reference_source_search', function () {
+        const state = referenceSourceDialogState;
+        if (!state) return;
+        const query = this.value.trim().toLowerCase();
+        document.getElementById('stsc_reference_source_items')?.querySelectorAll('[data-reference-source-row]').forEach(row => {
+            const entry = state.entries[Number(row.dataset.referenceSourceRow)];
+            row.hidden = Boolean(entry && query && !entry.name.toLowerCase().includes(query) && !entry.content.toLowerCase().includes(query));
+        });
+    });
+
+
+    $('#stsc_dialog_overlay').on('change', '#stsc_reference_plan_select', function () {
+        renderReferencePlansDialog(this.value);
+    });
+    $('#stsc_dialog_overlay').on('change', '[data-plan-field]', function () {
+        const plan = getReferencePlan(referencePlanDialogState?.id);
+        const id = $(this).closest('[data-plan-reference-id]').data('plan-reference-id');
+        const entry = plan?.entries.find(item => item.referenceId === id);
+        const field = $(this).data('plan-field');
+        if (!entry || !['enabled', 'addToCheck'].includes(field) || (field === 'addToCheck' && !entry.enabled)) return;
+        entry[field] = this.checked;
+        markDirty();
+        renderReferencePlansDialog(plan.id);
+    });
+    $('#stsc_dialog_overlay').on('click', '[data-plan-action]', function () {
+        try {
+            handleReferencePlanAction($(this).data('plan-action'), $(this).closest('[data-plan-reference-id]').data('plan-reference-id'));
+        } catch (error) {
+            toastr.warning(error.message, '墨提斯之镜');
+        }
+    });
+    $('#stsc_manager_overlay, #stsc_dialog_overlay').on('click', '[data-reference-group-action]', function () {
+        handleReferenceGroupAction($(this).data('reference-group-action'), String($(this).data('group-id') ?? ''));
+    });
+    $('#stsc_manager_overlay').on('change', '#stsc_reference_group_filter', function () {
+        referenceGroupFilter = this.value === '*' ? null : this.value;
+        renderReferencesTab();
+    });
+}
+
 function bindProviderControls() {
+    bindReferenceLibraryControls();
     const overlay = $('#stsc_manager_overlay');
     overlay.on('change', '#stsc_reuse_last_self_check', function () {
         getUiSettings().reuseLastSelfCheck = this.checked;
@@ -2582,6 +2657,533 @@ function getPresetBindingState(preset) {
     return { status: 'missing', name: preset.boundCharacterName || '未知角色' };
 }
 
+function normalizeReferenceGroups(settings) {
+    const ids = new Set();
+    const names = new Set([normalizePresetName('默认分组')]);
+    settings.referenceGroups = (Array.isArray(settings.referenceGroups) ? settings.referenceGroups : []).filter(group => {
+        if (!group || typeof group !== 'object' || Array.isArray(group)) return false;
+        if (typeof group.id !== 'string' || !group.id || group.id === '*' || ids.has(group.id)) return false;
+        if (typeof group.name !== 'string') return false;
+        const name = group.name.trim().slice(0, 80);
+        if (!name || names.has(normalizePresetName(name))) return false;
+        ids.add(group.id); names.add(normalizePresetName(name));
+        return true;
+    }).map(group => ({id: group.id, name: String(group.name).trim().slice(0, 80)}));
+    for (const reference of settings.references) {
+        if (!ids.has(reference.groupId)) reference.groupId = '';
+    }
+}
+
+function referenceGroupsForUi(settings = getUiSettings()) {
+    return [{id: '', name: '默认分组'}, ...(settings.referenceGroups || [])];
+}
+
+function referenceGroupOptions(selected = '', settings = getUiSettings()) {
+    return referenceGroupsForUi(settings).map(group => `<option value="${escapeHtml(group.id)}" ${group.id === selected ? 'selected' : ''}>${escapeHtml(group.name)}</option>`).join('');
+}
+
+function setReferenceGroupName(name, id = null, settings = getUiSettings()) {
+    const value = String(name || '').trim();
+    if (!value || value.length > 80) throw new Error('请输入1～80字的分组名称。');
+    if (referenceGroupsForUi(settings).some(group => group.id !== id && normalizePresetName(group.name) === normalizePresetName(value))) {
+        throw new Error('已经存在同名分组，请换一个名称。');
+    }
+    if (id === null) {
+        const group = {id: uid('refgroup'), name: value};
+        settings.referenceGroups.push(group);
+        return group;
+    }
+    const group = settings.referenceGroups.find(group => group.id === id);
+    if (!group) throw new Error('没有找到这个分组；默认分组不能改名。');
+    group.name = value;
+    return group;
+}
+
+function moveReferencesToGroup(ids, groupId, settings = getUiSettings()) {
+    if (!referenceGroupsForUi(settings).some(group => group.id === groupId)) throw new Error('目标分组不存在。');
+    const selected = new Set(ids);
+    let count = 0;
+    for (const reference of settings.references) {
+        if (selected.has(reference.id) && (reference.groupId || '') !== groupId) { reference.groupId = groupId; count++; }
+    }
+    return count;
+}
+
+function deleteReferenceGroup(id, settings = getUiSettings()) {
+    if (!id || !settings.referenceGroups.some(group => group.id === id)) return false;
+    moveReferencesToGroup(settings.references.filter(reference => reference.groupId === id).map(reference => reference.id), '', settings);
+    settings.referenceGroups = settings.referenceGroups.filter(group => group.id !== id);
+    collapsedReferenceGroupIds.delete(id);
+    if (referenceGroupFilter === id) referenceGroupFilter = '';
+    return true;
+}
+
+function moveReferenceInGroup(id, direction, settings = getUiSettings()) {
+    const index = settings.references.findIndex(reference => reference.id === id);
+    if (index < 0) return false;
+    const groupId = settings.references[index].groupId || '';
+    const peers = settings.references.filter(reference => (reference.groupId || '') === groupId);
+    const next = peers.findIndex(reference => reference.id === id) + direction;
+    if (next < 0 || next >= peers.length) return false;
+    const other = settings.references.findIndex(reference => reference.id === peers[next].id);
+    [settings.references[index], settings.references[other]] = [settings.references[other], settings.references[index]];
+    return true;
+}
+
+function revealReferenceGroup(referenceId, settings = getUiSettings()) {
+    referenceGroupFilter = null;
+    const reference = settings.references.find(reference => reference.id === referenceId);
+    collapsedReferenceGroupIds.delete(reference?.groupId || '');
+}
+
+function normalizeReferencePlans(settings) {
+    const references = new Map(settings.references.map(reference => [reference.id, reference]));
+    const seen = new Set();
+    settings.referencePlans = (Array.isArray(settings.referencePlans) ? settings.referencePlans : [])
+        .filter(plan => plan && typeof plan === 'object' && !Array.isArray(plan))
+        .map(plan => {
+            let id = typeof plan.id === 'string' ? plan.id : '';
+            if (!id || seen.has(id)) id = uid('refplan');
+            seen.add(id);
+            const entries = [];
+            const used = new Set();
+            for (const entry of Array.isArray(plan.entries) ? plan.entries : []) {
+                if (!entry || !references.has(entry.referenceId) || used.has(entry.referenceId)) continue;
+                used.add(entry.referenceId);
+                entries.push({ referenceId: entry.referenceId, enabled: entry.enabled !== false,
+                    addToCheck: Boolean(entry.addToCheck) });
+            }
+            return { id, name: String(plan.name || '未命名资料方案').trim().slice(0, 80) || '未命名资料方案', entries };
+        });
+    const bound = new Set();
+    settings.referencePlanBindings = (Array.isArray(settings.referencePlanBindings) ? settings.referencePlanBindings : [])
+        .filter(binding => {
+            if (!binding || typeof binding.characterKey !== 'string' || !binding.characterKey.startsWith('character:')
+                || !seen.has(binding.planId) || bound.has(binding.characterKey)) return false;
+            bound.add(binding.characterKey);
+            return true;
+        }).map(binding => ({ characterKey: binding.characterKey, characterName: String(binding.characterName || ''), planId: binding.planId }));
+    if (!seen.has(settings.defaultReferencePlanId)) settings.defaultReferencePlanId = '';
+}
+
+function getReferencePlan(id, settings = getUiSettings()) {
+    return settings.referencePlans?.find(plan => plan.id === id) || null;
+}
+
+function getEffectiveReferencePlan(settings = normalizeSettings()) {
+    const character = getCurrentCharacterEntity();
+    const binding = settings.referencePlanBindings?.find(item => item.characterKey === character.key);
+    return getReferencePlan(binding?.planId, settings) || getReferencePlan(settings.defaultReferencePlanId, settings);
+}
+
+function referencePlanName(name, excludeId = '', settings = getUiSettings()) {
+    const value = String(name || '').trim();
+    if (!value || value.length > 80) throw new Error('资料方案名称需为1—80字。');
+    if (settings.referencePlans.some(plan => plan.id !== excludeId && normalizePresetName(plan.name) === normalizePresetName(value))) {
+        throw new Error('已经存在同名资料方案，请换一个名称。');
+    }
+    return value;
+}
+
+function addReferencePlanEntries(plan, ids, settings = getUiSettings()) {
+    const used = new Set(plan.entries.map(entry => entry.referenceId));
+    for (const id of ids) {
+        const reference = settings.references.find(item => item.id === id);
+        if (!reference || used.has(id)) continue;
+        used.add(id);
+        plan.entries.push({ referenceId: id, enabled: true, addToCheck: Boolean(reference.addToCheck) });
+    }
+}
+
+function createReferencePlan(name, ids, settings = getUiSettings()) {
+    const plan = { id: uid('refplan'), name: referencePlanName(name, '', settings), entries: [] };
+    addReferencePlanEntries(plan, ids, settings);
+    settings.referencePlans.push(plan);
+    return plan;
+}
+
+function bindReferencePlan(id, settings = getUiSettings()) {
+    const character = getCurrentCharacterEntity();
+    if (!character.key) throw new Error('请先进入一个角色卡聊天，再绑定资料方案。');
+    if (!getReferencePlan(id, settings)) throw new Error('资料方案已不存在。');
+    settings.referencePlanBindings = settings.referencePlanBindings.filter(item => item.characterKey !== character.key);
+    settings.referencePlanBindings.push({ characterKey: character.key, characterName: character.name, planId: id });
+}
+
+function deleteReferencePlan(id, settings = getUiSettings()) {
+    settings.referencePlans = settings.referencePlans.filter(plan => plan.id !== id);
+    settings.referencePlanBindings = settings.referencePlanBindings.filter(binding => binding.planId !== id);
+    if (settings.defaultReferencePlanId === id) settings.defaultReferencePlanId = '';
+}
+
+function renderReferencePlansDialog(id = '') {
+    const settings = getUiSettings();
+    const plan = getReferencePlan(id, settings) || getEffectiveReferencePlan(settings) || settings.referencePlans[0];
+    const previous = referencePlanDialogState;
+    const scroll = previous?.mode === 'edit' && previous.id === plan?.id ? $('#stsc_dialog_body').scrollTop() : 0;
+    const character = getCurrentCharacterEntity();
+    const currentBinding = settings.referencePlanBindings.find(item => item.characterKey === character.key);
+    const effective = getEffectiveReferencePlan(settings);
+    const options = settings.referencePlans.map(item => `<option value="${escapeHtml(item.id)}" ${item.id === plan?.id ? 'selected' : ''}>${escapeHtml(item.name)}</option>`).join('');
+    const boundNames = plan ? settings.referencePlanBindings.filter(item => item.planId === plan.id)
+        .map(item => findCharacterEntity(item.characterKey)?.name || item.characterName || '原绑定角色') : [];
+    const entries = plan?.entries.map((entry, index) => {
+        const reference = settings.references.find(item => item.id === entry.referenceId);
+        if (!reference) return '';
+        return `<div class="stsc-plan-entry" data-plan-reference-id="${escapeHtml(reference.id)}">
+            <b>${escapeHtml(reference.name)}</b>
+            <div class="stsc-plan-entry-controls">
+                <label class="checkbox_label"><input type="checkbox" data-plan-field="enabled" ${entry.enabled ? 'checked' : ''}>启用资料</label>
+                <label class="checkbox_label"><input type="checkbox" data-plan-field="addToCheck" ${entry.addToCheck ? 'checked' : ''} ${entry.enabled && settings.mode !== 'dual_api' ? '' : 'disabled'}>单API：追加自检题</label>
+                <button class="menu_button stsc-small-button" type="button" data-plan-action="up" aria-label="上移资料" ${index ? '' : 'disabled'}>↑</button>
+                <button class="menu_button stsc-small-button" type="button" data-plan-action="down" aria-label="下移资料" ${index === plan.entries.length - 1 ? 'disabled' : ''}>↓</button>
+                <button class="menu_button stsc-small-button" type="button" data-plan-action="remove" aria-label="移出方案" title="仅移出方案，不删除原资料">− 移出</button>
+                <button class="menu_button stsc-small-button" type="button" data-plan-action="edit-source">前往编辑</button>
+            </div>
+        </div>`;
+    }).join('') || '<div class="stsc-empty">方案内还没有资料，可用下方加号添加。空方案生效时不发送任何参考资料。</div>';
+    openDialog('资料方案', `<div class="stsc-reference-plans" data-editing-plan-id="${escapeHtml(plan?.id || '')}">
+        <div class="stsc-muted">当前角色：${escapeHtml(character.name)}｜当前实际使用：${escapeHtml(effective?.name || '总资料库原有配置')}（按草稿预览）</div>
+        <div class="stsc-field"><label for="stsc_reference_plan_select">正在编辑的资料方案</label>
+            <select id="stsc_reference_plan_select" class="text_pole" ${plan ? '' : 'disabled'}>${options || '<option>暂无方案</option>'}</select></div>
+        <div class="stsc-toolbar"><button class="menu_button" type="button" data-plan-action="new">＋ 创建资料方案</button></div>
+        ${plan ? `<div class="stsc-field"><label for="stsc_reference_plan_name">方案名称</label>
+            <input id="stsc_reference_plan_name" class="text_pole" maxlength="80" value="${escapeHtml(plan.name)}"></div>
+            <div class="stsc-toolbar">
+                <button class="menu_button" type="button" data-plan-action="rename">重命名</button>
+                <button class="menu_button" type="button" data-plan-action="bind" ${character.key ? '' : 'disabled'}>绑定到当前角色</button>
+                <button class="menu_button" type="button" data-plan-action="unbind" ${currentBinding?.planId === plan.id ? '' : 'disabled'}>解除当前角色绑定</button>
+                <button class="menu_button" type="button" data-plan-action="default" ${settings.defaultReferencePlanId === plan.id ? 'disabled' : ''}>设为默认方案</button>
+                <button class="menu_button stsc-danger-button" type="button" data-plan-action="delete">删除方案</button>
+            </div>
+            <div class="stsc-muted">本方案已绑定：${escapeHtml(boundNames.join('、') || '无')}。${settings.defaultReferencePlanId === plan.id ? '本方案也是默认方案。' : ''}</div>
+            <div class="stsc-plan-entries">${entries}</div>
+            <button class="menu_button" type="button" data-plan-action="add">＋ 添加资料</button>` : '<div class="stsc-empty">创建方案后，可以组合资料并绑定角色。</div>'}
+        <div class="stsc-toolbar"><button class="menu_button" type="button" data-plan-action="clear-default" ${settings.defaultReferencePlanId ? '' : 'disabled'}>取消默认方案，恢复总库配置</button></div>
+        <div class="stsc-muted">角色绑定优先于默认方案；没有方案时沿用总库原有配置。选择方案只切换编辑，不自动应用。方案内开关、排序及自检问答独立于总库的启停和角色范围；内容仍共用原资料，请到总库编辑。</div>
+        <div class="stsc-muted">共享同一方案的角色会共用其勾选配置；需要不同配置请另建方案。所有修改（含绑定）点击“保存全部更改”或管理器顶部“保存更改”后生效，关闭弹窗不会自动保存。</div>
+    </div>`, '<button class="menu_button" type="button" data-dialog-action="cancel">返回资料库</button><button class="menu_button stsc-primary-button" type="button" data-plan-action="save">保存全部更改</button>');
+    referencePlanDialogState = { mode: 'edit', id: plan?.id || '' };
+    $('#stsc_dialog_body').scrollTop(scroll || 0);
+}
+
+function openReferencePlanPicker(id = '') {
+    const settings = getUiSettings();
+    const plan = getReferencePlan(id, settings);
+    const used = new Set(plan?.entries.map(entry => entry.referenceId));
+    const choices = settings.references.filter(reference => !used.has(reference.id)).map(reference => `
+        <label class="stsc-batch-reference-item"><input type="checkbox" data-plan-pick-id="${escapeHtml(reference.id)}">
+            <span class="stsc-batch-reference-main"><b>${escapeHtml(reference.name)}</b><span>${escapeHtml(referenceTypeLabel(reference.type))}</span></span></label>`).join('');
+    openDialog(plan ? '添加资料到方案' : '创建资料方案', `
+        ${plan ? '' : '<div class="stsc-field"><label for="stsc_new_reference_plan_name">方案名称</label><input id="stsc_new_reference_plan_name" class="text_pole" maxlength="80" placeholder="请输入资料方案名称"></div>'}
+        <div class="stsc-muted">从总资料库勾选要加入的资料。只保存引用，不复制或删除原资料；添加后默认启用，可在方案里分别关闭。</div>
+        <div class="stsc-toolbar"><button class="menu_button" type="button" data-plan-action="pick-all">全选</button><button class="menu_button" type="button" data-plan-action="pick-none">清空选择</button></div>
+        <div class="stsc-batch-reference-list">${choices || '<div class="stsc-empty">没有可添加的资料，请先在总资料库新建或导入。</div>'}</div>`,
+        '<button class="menu_button" type="button" data-plan-action="back">返回方案</button><button class="menu_button stsc-primary-button" type="button" data-plan-action="confirm-pick">确认选择</button>');
+    referencePlanDialogState = { mode: 'pick', id: plan?.id || '' };
+}
+
+function handleReferencePlanAction(action, referenceId = '') {
+    const settings = getUiSettings();
+    const plan = getReferencePlan(referencePlanDialogState?.id, settings);
+    if (action === 'new') return openReferencePlanPicker();
+    if (action === 'back') return renderReferencePlansDialog(plan?.id);
+    if (action === 'pick-all' || action === 'pick-none') {
+        $('#stsc_dialog_body [data-plan-pick-id]').prop('checked', action === 'pick-all');
+        return;
+    }
+    if (action === 'save') {
+        closeDialog();
+        commitEditDraft();
+        return;
+    }
+    if (action === 'confirm-pick') {
+        const ids = $('#stsc_dialog_body [data-plan-pick-id]:checked').map((_, element) => String($(element).data('plan-pick-id'))).get();
+        const target = plan || createReferencePlan(document.getElementById('stsc_new_reference_plan_name')?.value, ids, settings);
+        if (plan) addReferencePlanEntries(plan, ids, settings);
+        markDirty();
+        renderReferencesTab();
+        return renderReferencePlansDialog(target.id);
+    }
+    if (action === 'clear-default') {
+        settings.defaultReferencePlanId = '';
+    } else {
+        if (!plan) return;
+        if (action === 'add') return openReferencePlanPicker(plan.id);
+        if (action === 'rename') plan.name = referencePlanName(document.getElementById('stsc_reference_plan_name')?.value, plan.id, settings);
+        else if (action === 'bind') bindReferencePlan(plan.id, settings);
+        else if (action === 'unbind') {
+            const key = getCurrentCharacterEntity().key;
+            settings.referencePlanBindings = settings.referencePlanBindings.filter(item => item.characterKey !== key || item.planId !== plan.id);
+        } else if (action === 'default') settings.defaultReferencePlanId = plan.id;
+        else if (action === 'delete') {
+            openDeleteConfirmation({ title: '删除资料方案', message: `确定删除方案“${plan.name}”吗？`,
+                detail: '只删除方案及它的角色/默认绑定，不会删除总资料库的任何资料。绑定角色将改用默认方案或总库原有配置。',
+                perform: () => { deleteReferencePlan(plan.id, settings); markDirty(); renderReferencesTab(); renderReferencePlansDialog(); } });
+            return;
+        } else {
+            const index = plan.entries.findIndex(entry => entry.referenceId === referenceId);
+            if (index < 0) return;
+            if (action === 'edit-source') {
+                closeDialog();
+                revealReferenceGroup(referenceId, settings);
+                expandedReferenceIds.add(referenceId);
+                renderReferencesTab();
+                // Native scrolling, no lock handlers or changes to other plugin menus.
+                document.getElementById('stsc_tab_references')?.querySelectorAll('[data-reference-id]').forEach(card => {
+                    if (card.dataset.referenceId === referenceId) card.scrollIntoView({ block: 'start' });
+                });
+                return;
+            }
+            if (action === 'remove') plan.entries.splice(index, 1);
+            else if (action === 'up' || action === 'down') {
+                const next = index + (action === 'up' ? -1 : 1);
+                if (next < 0 || next >= plan.entries.length) return;
+                [plan.entries[index], plan.entries[next]] = [plan.entries[next], plan.entries[index]];
+            } else return;
+        }
+    }
+    markDirty();
+    renderReferencesTab();
+    renderReferencePlansDialog(plan?.id);
+}
+
+function openReferenceGroupDialog(action, id = '') {
+    const settings = getUiSettings();
+    const group = referenceGroupsForUi(settings).find(group => group.id === id);
+    if (action !== 'new' && !group) return;
+    if (action === 'delete') {
+        if (!id) return;
+        openDeleteConfirmation({title: '删除资料分组', message: `确定删除分组“${group.name}”吗？`,
+            detail: '组内资料全部移回默认分组，不删除资料，也不改变资料方案或角色绑定。点击保存更改后生效。',
+            perform: () => { if (deleteReferenceGroup(id, getUiSettings())) { markDirty(); renderReferencesTab(); } }});
+        return;
+    }
+    if (action === 'move') {
+        const choices = settings.references.filter(reference => (reference.groupId || '') !== id).map(reference => `
+            <label class="stsc-batch-reference-item"><input type="checkbox" data-group-pick-id="${escapeHtml(reference.id)}">
+            <span class="stsc-batch-reference-main"><b>${escapeHtml(reference.name)}</b><span>${escapeHtml(referenceGroupsForUi(settings).find(group => group.id === (reference.groupId || ''))?.name || '默认分组')}</span></span></label>`).join('');
+        openDialog(`移入资料：${group.name}`, `<div class="stsc-muted">勾选要移入的资料，只调整所属分组，不复制资料、不改变启用和自检设置。</div>
+            <div class="stsc-toolbar"><button class="menu_button" type="button" data-reference-group-action="pick-all">全选</button><button class="menu_button" type="button" data-reference-group-action="pick-none">清空选择</button></div>
+            <div class="stsc-batch-reference-list">${choices || '<div class="stsc-empty">没有其他分组的资料可移入。</div>'}</div>`,
+            `<button class="menu_button" type="button" data-dialog-action="cancel">取消</button><button class="menu_button stsc-primary-button" type="button" data-reference-group-action="confirm-move" data-group-id="${escapeHtml(id)}">确认移入</button>`);
+        return;
+    }
+    openDialog(action === 'new' ? '新建资料分组' : '重命名资料分组',
+        `<div class="stsc-field"><label for="stsc_reference_group_name">分组名称</label><input id="stsc_reference_group_name" class="text_pole" type="text" maxlength="80" value="${escapeHtml(action === 'new' ? '' : group.name)}"></div><div class="stsc-muted">只整理总资料库，不改变资料方案、启用状态和发送顺序。完成后请点击顶部“保存更改”。</div><div id="stsc_reference_group_error" class="stsc-dialog-error"></div>`,
+        `<button class="menu_button" type="button" data-dialog-action="cancel">取消</button><button class="menu_button stsc-primary-button" type="button" data-reference-group-action="${action === 'new' ? 'confirm-new' : 'confirm-rename'}" data-group-id="${escapeHtml(id)}">确认</button>`);
+}
+
+function handleReferenceGroupAction(action, id = '') {
+    const settings = getUiSettings();
+    if (['new', 'rename', 'delete', 'move'].includes(action)) return openReferenceGroupDialog(action, id);
+    if (action === 'toggle') {
+        if (collapsedReferenceGroupIds.has(id)) collapsedReferenceGroupIds.delete(id);
+        else collapsedReferenceGroupIds.add(id);
+        renderReferencesTab();
+        return;
+    }
+    if (action === 'pick-all' || action === 'pick-none') {
+        $('#stsc_dialog_body [data-group-pick-id]').prop('checked', action === 'pick-all');
+        return;
+    }
+    try {
+        if (action === 'confirm-new' || action === 'confirm-rename') {
+            const group = setReferenceGroupName(document.getElementById('stsc_reference_group_name')?.value, action === 'confirm-new' ? null : id, settings);
+            referenceGroupFilter = group.id;
+            collapsedReferenceGroupIds.delete(group.id);
+        } else if (action === 'confirm-move') {
+            const ids = $('#stsc_dialog_body [data-group-pick-id]:checked').map((_, element) => String($(element).data('group-pick-id'))).get();
+            if (!ids.length) { toastr.warning('请至少选择一条资料。', '墨提斯之镜'); return; }
+            if (!moveReferencesToGroup(ids, id, settings)) return;
+            referenceGroupFilter = id;
+            collapsedReferenceGroupIds.delete(id);
+        } else return;
+        markDirty(); closeDialog(); renderReferencesTab();
+    } catch (error) {
+        $('#stsc_reference_group_error').text(error.message);
+        toastr.warning(error.message, '墨提斯之镜');
+    }
+}
+
+function readCurrentPresetReferenceEntries(context) {
+    const settings = context?.chatCompletionSettings;
+    if ((context?.mainApi && context.mainApi !== 'openai') || !Array.isArray(settings?.prompts)) return null;
+    // SillyTavern uses global prompt order (dummy character 100001) for Chat Completion.
+    const order = Array.isArray(settings.prompt_order)
+        ? settings.prompt_order.find(item => String(item?.character_id) === '100001')?.order : null;
+    const orderById = new Map(Array.isArray(order) ? order.filter(item => item?.identifier).map((item, index) => [item.identifier, { index, enabled: item.enabled }]) : []);
+    const entries = settings.prompts
+        .filter(item => !item?.marker && typeof item?.content === 'string' && item.content.trim())
+        .map((item, index) => ({
+            name: typeof item.name === 'string' && item.name.trim() ? item.name.trim() : `预设条目 ${index + 1}`,
+            content: item.content,
+            disabled: item.enabled === false || (Array.isArray(order) && orderById.get(item.identifier)?.enabled !== true),
+            order: orderById.get(item.identifier)?.index ?? Infinity,
+        })).sort((a, b) => a.order - b.order);
+    return { name: typeof settings.preset_settings_openai === 'string' ? settings.preset_settings_openai : '', entries };
+}
+
+function listReferenceSourceWorldBooks(context) {
+    // Older SillyTavern builds expose the same names in the world editor selector.
+    const names = typeof context?.getWorldInfoNames === 'function'
+        ? context.getWorldInfoNames()
+        : Array.from(document.getElementById('world_editor_select')?.options || [])
+            .filter(option => option.value !== '').map(option => option.textContent);
+    return [...new Set(Array.isArray(names) ? names.filter(name => typeof name === 'string' && name.trim()) : [])];
+}
+
+function readWorldReferenceEntries(book) {
+    if (!book?.entries || typeof book.entries !== 'object') return [];
+    return Object.values(book.entries)
+        .filter(item => typeof item?.content === 'string' && item.content.trim())
+        .map((item, index) => ({
+            name: (typeof item.comment === 'string' && item.comment.trim())
+                || (Array.isArray(item.key) && item.key.filter(key => typeof key === 'string' && key.trim()).join('、'))
+                || `世界书条目 ${index + 1}`,
+            content: item.content,
+            disabled: item.disable === true,
+            order: Number.isFinite(item.displayIndex) ? item.displayIndex : Infinity,
+        })).sort((a, b) => a.order - b.order);
+}
+
+function renderReferenceSourceDialog(state) {
+    const items = state.entries.map((entry, index) => {
+        const preview = entry.content.trim();
+        return `<label class="stsc-batch-reference-item" data-reference-source-row="${index}">
+            <input type="checkbox" data-reference-source-entry="${index}" ${state.selected.has(index) ? 'checked' : ''}>
+            <span class="stsc-batch-reference-main"><b>${escapeHtml(entry.name)}</b>
+                ${entry.disabled ? '<span>原条目已关闭或未启用</span>' : ''}
+                <span class="stsc-reference-source-preview">${escapeHtml(preview.slice(0, 300))}${preview.length > 300 ? '…' : ''}</span>
+            </span></label>`;
+    }).join('');
+    openDialog('从预设／世界书导入',
+        `<div class="stsc-field"><label for="stsc_reference_source_kind">导入来源</label>
+            <select id="stsc_reference_source_kind" class="text_pole">
+                <option value="preset" ${state.source === 'preset' ? 'selected' : ''}>当前酒馆预设</option>
+                <option value="world" ${state.source === 'world' ? 'selected' : ''}>世界书</option>
+            </select></div>
+        ${state.source === 'world' ? `<div class="stsc-field"><label for="stsc_reference_source_book">选择世界书</label>
+            <select id="stsc_reference_source_book" class="text_pole">
+                <option value="">请选择一本世界书</option>
+                ${state.books.map((name, index) => `<option value="${index}" ${state.bookIndex === index ? 'selected' : ''}>${escapeHtml(name)}</option>`).join('')}
+            </select></div>` : `<div class="stsc-muted">当前预设：${escapeHtml(state.name || '未命名／不可用')}</div>`}
+        <div class="stsc-muted">只复制名称和正文，导入为独立资料，归入默认分组并保持关闭。不修改原预设或世界书，不继承触发规则，也不生成自检问题。</div>
+        ${items ? `<div class="stsc-batch-reference-tools">
+            <input id="stsc_reference_source_search" class="text_pole" type="search" placeholder="搜索条目名称或正文" aria-label="搜索条目名称或正文">
+            <span id="stsc_reference_source_count" class="stsc-muted" aria-live="polite">已选择 ${state.selected.size} 条</span>
+            </div><div id="stsc_reference_source_items" class="stsc-batch-reference-list">${items}</div>`
+            : `<div class="stsc-empty" role="status">${escapeHtml(state.message)}</div>`}
+        ${state.failed ? '<button class="menu_button" type="button" data-dialog-action="retry-reference-source-book">重试读取</button>' : ''}`,
+        '<button class="menu_button" type="button" data-dialog-action="cancel">取消</button>'
+        + `<button class="menu_button stsc-primary-button" type="button" data-dialog-action="confirm-reference-source" ${state.selected.size ? '' : 'disabled'}>确认导入</button>`);
+    referenceSourceDialogState = state;
+    $('#stsc_dialog_body').scrollTop(0);
+}
+
+function openReferenceSourceDialog(source = 'preset') {
+    const state = { source, books: [], bookIndex: -1, name: '', entries: [], selected: new Set(), message: '' };
+    try {
+        const context = ctx();
+        if (source === 'world') {
+            state.books = listReferenceSourceWorldBooks(context);
+            state.message = state.books.length ? '请先选择一本世界书。切换世界书会清空当前勾选。' : '没有可读取的世界书。';
+        } else {
+            const preset = readCurrentPresetReferenceEntries(context);
+            if (preset) Object.assign(state, preset);
+            state.message = preset ? '当前预设没有可复制的正文条目。' : '未能读取当前聊天补全预设，仍可切换至世界书导入。';
+        }
+    } catch {
+        state.message = '读取来源失败，请关闭窗口后重试。';
+    }
+    renderReferenceSourceDialog(state);
+}
+
+async function selectReferenceSourceBook(value) {
+    const state = referenceSourceDialogState;
+    if (state?.source !== 'world') return;
+    const index = value === '' ? -1 : Number(value);
+    const name = Number.isInteger(index) && index >= 0 ? state.books[index] : null;
+    const request = {};
+    Object.assign(state, { request, bookIndex: name ? index : -1, entries: [], selected: new Set(), failed: false,
+        message: name ? '正在读取世界书条目…' : '请先选择一本世界书。' });
+    renderReferenceSourceDialog(state);
+    if (!name) return;
+    try {
+        const book = await ctx()?.loadWorldInfo?.(name);
+        if (!book) throw new Error('World book unavailable');
+        if (referenceSourceDialogState !== state || state.request !== request) return;
+        state.entries = readWorldReferenceEntries(book);
+        state.message = '这本世界书没有可复制的正文条目。';
+    } catch {
+        if (referenceSourceDialogState !== state || state.request !== request) return;
+        state.failed = true;
+        state.message = '读取世界书失败，请重试或选择其他世界书。';
+    }
+    renderReferenceSourceDialog(state);
+}
+
+function confirmReferenceSourceImport() {
+    const state = referenceSourceDialogState;
+    if (!state?.selected.size || !editDraft) return;
+    const entries = state.entries.filter((_, index) => state.selected.has(index));
+    for (const entry of entries) {
+        editDraft.references.push({ ...createReference(makeUniqueReferenceName(entry.name)), content: entry.content, enabled: false });
+    }
+    if (!entries.length) return;
+    revealReferenceGroup('', editDraft);
+    markDirty();
+    closeDialog();
+    renderReferencesTab();
+    toastr.success(`已导入 ${entries.length} 条资料。请点击顶部“保存更改”。`, '墨提斯之镜');
+}
+
+function getDualApiUserContext({ compact = false } = {}) {
+    const context = ctx();
+    if (!context) return '（未读取到当前用户身份设定，请勿自行补充。）';
+    const name = compactPromptText(context.name1);
+    const personaSettings = context.powerUserSettings;
+    // SillyTavern persona_description_positions.NONE = 9. Respect explicit opt-out.
+    const disabled = Number(personaSettings?.persona_description_position) === 9;
+    let description = '';
+    if (!disabled) {
+        if (typeof personaSettings?.persona_description === 'string') {
+            // This is the active editor value, not the library of other personas.
+            description = personaSettings.persona_description;
+            if (description && typeof context.substituteParams === 'function') {
+                try {
+                    const expanded = context.substituteParams(description, context.name1, context.name2, undefined, undefined, false);
+                    if (typeof expanded === 'string') description = expanded;
+                } catch {
+                    // Keep the current description if a host macro cannot be expanded.
+                }
+            }
+        } else if (typeof context.getCharacterCardFields === 'function') {
+            // Compatibility with hosts exposing persona through the public field getter.
+            try {
+                const persona = context.getCharacterCardFields()?.persona;
+                if (typeof persona === 'string') description = persona;
+            } catch {
+                // Missing host support must not stop self-check or use a stale persona.
+            }
+        }
+    }
+    description = compactPromptText(description);
+    if (compact) description = compactDualApiRetryText(description, 12000);
+    return [
+        '以下是用户扮演的身份，不是AI扮演的角色；请区分双方设定，未提供的信息不要自行补充。',
+        name ? `【用户名称】\n${name}` : '',
+        disabled ? '（酒馆已将此身份描述设为不发送，本轮不读取该描述。）'
+            : description ? `【用户身份描述】\n${description}` : '（当前没有可读取的用户身份描述。）',
+    ].filter(Boolean).join('\n\n');
+}
+
+function onReferencePlanChatChanged() {
+    const state = referencePlanDialogState;
+    renderAll();
+    if (state?.mode === 'edit') renderReferencePlansDialog(state.id);
+}
+
 function referenceApplies(reference) {
     if (!reference.enabled || !reference.content.trim()) return false;
     if (reference.scope === 'global') return true;
@@ -2590,6 +3192,15 @@ function referenceApplies(reference) {
 }
 
 function getActiveReferences(settings = normalizeSettings()) {
+    const plan = getEffectiveReferencePlan(settings);
+    if (plan) {
+        const references = new Map(settings.references.map(reference => [reference.id, reference]));
+        // Membership/binding replaces the library's legacy enabled/scope flags for this plan only.
+        return plan.entries.filter(entry => entry.enabled).map(entry => {
+            const reference = references.get(entry.referenceId);
+            return reference ? { ...reference, enabled: true, addToCheck: entry.addToCheck } : null;
+        }).filter(reference => reference && reference.content.trim());
+    }
     return settings.references.filter(referenceApplies);
 }
 
@@ -2611,33 +3222,12 @@ function makeReferenceQuestion(reference) {
 }
 
 function makeDualApiReferenceQuestion(reference) {
-    const config = referenceTypeConfig(reference.type);
-    const name = reference.name || '未命名资料';
-    const textByType = {
-        style: `请根据【${name}】文风资料，完整说明本轮正文具体应如何输出，包括语言风格、句式节奏、描写重点、台词特点以及必须避免的表达。答案必须复述本轮真正需要执行的具体规则，使没有读取该资料的写作模型仅凭答案也能准确执行；不得只回答“遵照资料”“按上述要求”或使用其他模糊指代。`,
-        restriction: `请根据【${name}】限制资料，完整列出本轮必须遵守的限制、禁止出现的内容、允许保留的表现，以及正文应如何具体规避违规。答案必须复述实际限制，使没有读取该资料的写作模型也能独立执行；不得只回答“会遵守”“没有违反”或使用其他模糊指代。`,
-        other: `请根据【${name}】资料，提取与本轮剧情有关的具体信息，并完整说明这些信息将如何影响角色判断、行动、台词、剧情发展或输出格式。答案必须包含正文生成所需的实际内容，使没有读取该资料的写作模型也能独立执行；不得只引用资料名称或使用“按资料处理”等模糊指代。`,
-    };
-
-    return {
-        id: `ref_${reference.id}`,
-        text: textByType[reference.type] || textByType.other,
-        type: 'open',
-        length: 'detailed',
-        requireEvidence: true,
-        enabled: true,
-        source: `参考资料库-${config.label}-${name}`,
-        referenceId: reference.id,
-    };
+    return { ...makeReferenceQuestion(reference), referenceId: reference.id };
 }
 
 function getDualApiQuestions(settings = normalizeSettings()) {
-    const questions = getActiveQuestions(settings).map(question => clone(question));
-    const referenceMap = new Map(getActiveReferences(settings).map(reference => [`ref_${reference.id}`, reference]));
-    return questions.map(question => {
-        const reference = referenceMap.get(question.id);
-        return reference ? makeDualApiReferenceQuestion(reference) : question;
-    });
+    // References are shared reviewer context, independent of the chosen question preset.
+    return getActiveQuestions(settings).filter(question => !question.referenceId && !String(question.id).startsWith('ref_')).map(question => clone(question));
 }
 
 function getActiveQuestions(settings = normalizeSettings()) {
@@ -2658,7 +3248,7 @@ function getActiveQuestions(settings = normalizeSettings()) {
     }
 
     for (const reference of getActiveReferences(settings)) {
-        if (reference.addToCheck) result.push(makeReferenceQuestion(reference));
+        if (reference.addToCheck && settings.mode !== 'dual_api' && reference.sendToMain === true) result.push(makeReferenceQuestion(reference));
     }
 
     return result;
@@ -2714,7 +3304,6 @@ function buildQuestionXml(questions) {
         return [
             `<question id="${requestId}" index="${index + 1}" evidence_required="${question.requireEvidence ? 'true' : 'false'}">`,
             `<text>${escapeXml(question.text)}</text>`,
-            `<source>${escapeXml(question.source || '')}</source>`,
             `<type>${typeRule}</type>`,
             `<length>${lengthInstruction(question.length)}</length>`,
             `<evidence_rule>${evidenceRule}</evidence_rule>`,
@@ -2811,7 +3400,7 @@ function clearRuntimePrompts() {
 }
 
 function applyReferencePrompts(references) {
-    for (const reference of references) {
+    for (const reference of references.filter(item => item.sendToMain === true)) {
         setRuntimePrompt(`stsc_ref_${reference.id}`, buildReferencePrompt(reference), reference);
     }
 }
@@ -3050,11 +3639,11 @@ ${compact ? '这是一次自动精简重试：只读取必要角色信息和最�
 
 工作要求：
 1. 结合角色资料、经过酒馆出站正则处理后的聊天记录、插件参考资料、快捷指令和本轮问题，逐题形成最终写作结论。
-2. 每个答案都必须能直接交给另一个没有看到题目背景或资料原文的写作模型执行。
-3. 尤其是参考资料库问题，必须明确复述本轮具体该怎样写、必须遵守什么、禁止什么，不得只写“遵照资料”“符合要求”“按上述内容执行”等模糊结论。
+2. 先阅读本轮参考资料，将适用内容作为各题答题依据，再完成全部问题；资料参考独立于自检预设，不依赖额外资料题。
+3. 答案只写本轮具体结论，不复述、罗列或引用整份资料规则。完成后核对各题答案与资料是否有冲突；有疑似冲突时，仅在对应题答案中简短标明“置信度低：Q题号＋疑似不符合的方向”，不重复规则原文；没有疑点则不输出核查说明。资料缺失或不足时不得假装已验证。
 4. 不得漏题、合并题目或改变 q1、q2 这类短题号。
 5. 对 evidence_required="true" 的问题，必须输出非空的 <evidence>，写明可核对的角色设定、剧情上下文、资料规则或世界观依据。
-6. 每个答案只写最终结论，控制在1—3句；依据通常只写1句。不要展开思考过程，避免输出过长而截断。
+6. 每个答案只写最终结论，控制在1—3句；依据只需最小必要出处或本轮事实，不复制整条资料规则，通常只写1句。不要展开思考过程，避免输出过长而截断。
 7. ${reviewEnabledForThisRun ? '必须先完整输出 <stsc_previous_review>，随后输出 <stsc_self_check>；两段都不得省略。' : '只输出 <stsc_self_check>，不得额外输出复盘标签。'}
 8. 除下方指定的XML外，不要输出“无需依据／需要依据”等说明文字、Markdown代码围栏或正文。
 
@@ -3063,6 +3652,9 @@ ${requiredOutputSchema}
 
 【当前角色资料】
 ${characterContext}
+
+【当前用户身份设定（User / Persona）】
+${replay ? '身份信息以真实主请求快照为准。' : getDualApiUserContext({ compact })}
 
 【本轮启用的插件参考资料库】
 ${buildDualApiReferenceContext(references, { compact })}
@@ -3077,10 +3669,10 @@ ${reviewEnabledForThisRun ? `【必须完成的上一轮复盘任务】\n${revie
 
     const answerStyleInstruction = settings.dualApi.transformFormat
         ? `回答将被转换为强力执行规范。每个 <answer> 只写可直接执行的结论：不要重复问题、资料库名称或分析过程；优先使用“必须／不得／应当”等明确措辞，控制在 1—3 条完整规则内。<evidence> 只保留最关键依据，通常 1 句，且不要重复答案。`
-        : `每个 <answer> 必须完整、明确、自包含，不得只回答“是／否”“会遵照”或使用依赖原文才能理解的模糊指代。`;
+        : `每个 <answer> 写清本题结论，不得仅回答“是／否”“会遵照”；不重复资料原文。`;
 
     const questionPrompt = `
-请现在${reviewEnabledForThisRun ? '先完成上一轮复盘，再完成' : '只完成'}本轮全部自检。回答必须自包含：即使下一步写作模型看不到问题、参考资料原文和你的分析过程，也能仅凭每个 <answer> 准确执行。不得输出正文。
+请现在${reviewEnabledForThisRun ? '先完成上一轮复盘，再完成' : '只完成'}本轮全部自检。回答只给本轮可用结论，不重复资料规则或分析过程；需要遵守的资料已作为答题参考，不另行生成资料复述题。不得输出正文。
 ${answerStyleInstruction}
 
 本轮问题：
@@ -3379,109 +3971,47 @@ function buildDualApiAdjudicationPrompt() {
     return `
 【外部自检裁决】
 
-以下自检/导演内容由外部模型生成，只用于辅助本轮写作，不拥有高于USER原文、角色设定、世界观、已成立剧情与当前上下文的事实权限。
+外部自检仅辅助写作；你是事实、因果、人物、时机与执行的最终裁决者。规划正文前，独立核对USER本轮原文、完整角色设定、世界观、已成立剧情与当前上下文。自检摘要不得替代原始信息，其遗漏不使既有细节失效。
 
-你是最终的事实、因果、人物、时机与执行裁决者。
+【权限审计】
 
-在正文规划前，必须自行重新读取USER最后一条输入、相关角色设定、世界观与当前上下文，恢复完整事实链和人物因果。不得用外部自检的摘要替代原始信息，也不得因为外部自检遗漏某个既有细节，就忽略该细节。
+- [USER-HARD]：仅执行USER本轮原文直接支持的硬要求，不接受自检新增、扩写或强化的要求。
+- [CANON-HARD]：仅执行角色设定、世界观或已成立剧情直接支持的内容；冲突时以原始信息为准。
+- [RESPONSE-OBLIGATION]：对应事件必须得到角色实质回应，但具体动作、台词、强度、手段与结果由你依据完整人物和当前因果裁决。
+- [CREATIVE-FUEL]：普通创意候选，可采用、改写、组合或舍弃。
+- [NSFW-FUEL]：创意机制候选，不是MUST；按下方规则处理。
+- [RISK]：核查线索，不构成事实或结论。
 
-对外部自检中的内容按以下权限处理：
+无论使用何种标签，自检中的[MUST]、[MUST-NOT]、[CHANGE]、[ADAPT]、[STOP]等措辞均不自动获得强制权限。只有USER明确硬要求、既有硬事实/边界/canon及最低限度回应义务可构成硬约束；自检自行生成的候选、推断、动作、称呼、主题、玩法或因果均不因此升级。
 
-- [USER-HARD]：仅当内容能够被USER本轮原文直接支持时，视为硬要求。若外部自检对USER原意进行了扩写、强化、改写或新增细节，只执行原文能够支持的部分。
-- [CANON-HARD]：仅当内容能够被当前角色设定、世界观或已经成立的剧情直接支持时执行。若与完整上下文冲突，以原始canon与已发生剧情为准。
-- [RESPONSE-OBLIGATION]：只要求“对应事件必须得到角色真实回应”。外部自检给出的具体动作、台词、强度、手段或结果不自动成为唯一执行方式，应结合完整人物和当前因果自行决定最合适的实际回应。
-- [CREATIVE-FUEL]：仅为创意候选，不是命令，可以采用、改写、组合或舍弃。
-- [NSFW-FUEL]：仅为创意候选，不是命令；具体处理遵循下方【NSFW创意机制保留】规则。
+涉及时间顺序、角色知识边界或人物因果的冲突，同样以原始上下文为准。
 
 【NSFW创意机制保留】
 
-外部自检中的 [NSFW-FUEL] 仅提供“创意机制候选”，不拥有角色解释权、事实权限或执行决定权。
+先拆分：
+- mechanism_core：创意机制核心；
+- interpretation_layer：附带的人物解释、动机、USER结果、关系含义及结局判断。
 
-【NSFW创意继承总纲】
-疯玩法可以留，疯人物解释别留。
-
-外部自检中的 [NSFW-FUEL] 可以大胆提供极端、恶俗、反常规或高张力的创意机制，但这些机制不自动携带对角色人格、USER心理、关系含义、人物命运或结局性质的解释权。
-
-主模型应先分离：
-- mechanism_core：创意机制本身；
-- interpretation_layer：自检附带的人物解释、动机解释、USER结果、关系含义与结局判断。
-
-若 mechanism_core 与角色核心设定、hard canon、已成立剧情和当前场景相容，则优先保留机制核心。
-若仅 interpretation_layer 错误，应删除或重写错误解释，不得因此把整个机制替换成角色既往高频玩法或模型惯用方案。
-
-人物一致性裁决回答的是：
-“这个角色会怎样使用这个机制？”
-而不是：
-“这个角色是否只能继续使用自己过去最熟悉的机制？”
-
-优先级始终为：
-
+优先级：
 角色核心设定 / hard canon / 已成立剧情 / 当前场景条件
 ＞
-外部自检提供的具体NSFW创意机制
+相容的具体外部NSFW机制
 ＞
-角色卡或主预设中的既往高频玩法 / 模型自身习惯方案。
+角色卡或主预设中的既往高频玩法 / 模型惯用方案。
 
-当外部自检已经给出具体、可执行的NSFW创意机制时，主模型应优先尝试保留其“机制核心”，再依据角色人格、关系、当前状态与场景重新设计具体执行方式，不应直接回退到角色过去最常用的玩法将其整体替代。
+外部机制不拥有角色解释权、事实权限或执行决定权，不据此新增USER心理、生理、情绪、同意、偏好、选择、反应或结果。
 
-这里的“保留机制核心”不等于保留外部自检给出的：
-- 角色动机；
-- 行为语气；
-- 强度；
-- 节奏；
-- 具体执行动作；
-- USER反应；
-- USER心理、生理、情绪、同意、偏好、选择或结果；
-- 关系含义；
-- 事后结论。
+对具体、可执行且相容的机制，优先保留核心，再按角色人格、关系、状态与场景设计执行；不要求照搬动机、语气、强度、节奏、具体动作、关系解释或事后结论。
 
-以上内容均由主模型依据 canon、当前上下文与角色连续性重新裁决。
+执行方式OOC，优先重写执行；人物解释或USER结果错误，删除或修正解释，保留可用机制。仅当机制核心本身须严重扭曲角色核心人格、关系逻辑，或违背hard canon、已成立剧情、当前场景条件、现实可行性或USER本轮明确禁项才能成立时，才舍弃、弱化或替换。
 
-若问题只出在外部自检提供的“执行方式”OOC：
-→ 优先保留机制，重写执行方式。
-
-若问题出在外部自检提供的“人物动机、USER结果、关系解释”错误：
-→ 删除错误解释，保留可用机制。
-
-若机制核心本身只有在明显扭曲角色核心人格、关系逻辑、hard canon 或当前场景条件时才能成立：
-→ 才允许舍弃、弱化或替换该机制。
-
-“更符合角色”优先理解为：
-让这个角色以自己的方式使用新机制，
-而不是把新机制替换成这个角色以前最常使用的玩法。
-
-人物裁决负责决定：
-“这个角色会怎样使用这个机制”
-而不是决定：
-“这个角色只使用自己过去最熟悉的机制”。
-
-- [RISK]：仅作为核查提示，不自动构成事实或结论。
-
-即使外部自检没有使用以上标签，也必须按实际来源审计其内容。外部自检内部出现的[MUST]、[MUST-NOT]、[CHANGE]、[ADAPT]、[STOP]或类似强制措辞，不自动获得强制权限；只有被USER原文、既有canon或最低限度回应义务直接支持的部分才可作为硬要求。
-
-【权限来源审计】
-
-任何准备作为“必须执行”的内容，都要先确认其来源：
-1. USER本轮明确要求；
-2. 已建立的硬事实、明确边界或canon；
-3. 为回应当前事件所必需的最低限度互动义务。
-
-若来源只是外部自检自身的发散、候选、推断、新增动作、新增称呼、新增主题、具体玩法或具体因果，则不得将其视为MUST。
-
-若外部自检与USER原文、canon、时间顺序、角色知识边界、已成立事件或人物因果冲突，以原始信息为准。
+不得仅因更熟悉某种写法或角色过去常用某种玩法而整体替换新机制。“更符合角色”首先意味着让角色以自己的方式使用新机制，而非退回旧套路。
 
 【裁决不得成为回避工具】
 
-外部素材可以被拒绝或改写，但不得借此整体降低USER明确要求的张力、事件密度、主动性、大胆程度或展开程度。
+不得借裁决整体降低USER明确要求的张力、事件密度、主动性、大胆程度或展开程度。拒绝具体候选时，优先寻找叙事功能相近、张力不低且符合人物与事实的实现。
 
-若USER明确要求高张力、大胆、恶俗、新玩法、强冲突、充分展开或类似效果：
-- 不得把所有高强度候选过滤后退回最轻、最安全、最容易收束的方案；
-- 若拒绝某个具体候选，应优先寻找叙事功能相近、张力不低但更符合人物与事实的替代方案；
-- “更符合人设”不等于更克制、更安全、更少发生事情；
-- 不得用沉默、微动作、暗示、转场、事后概述或快速收束替代本应实际发生的互动；
-- 外部自检负责扩展候选空间，你负责从完整上下文中选择或改写真正适合当前人物的实现。
-
-外部自检遗漏的既有细节仍然有效；不要只围绕外部自检提到的内容规划正文。
+“符合人设”不等于更克制、更少发生事情；不得以沉默、微动作、暗示、转场、事后概述或快速收束替代应实际发生的互动。依据完整上下文规划正文，不把自检候选锁成唯一大纲。
 `.trim();
 }
 
@@ -3654,15 +4184,23 @@ async function markLatestIssueViewed() {
 
 function normalizeModelXmlText(text) {
     const original = String(text ?? '');
-    const containsPluginProtocol = /<answer\b[^>]*(?:id|index)=/i.test(original) || /<\/?stsc_(?:self_check|previous_review|response)\b/i.test(original)
+    const containsPluginProtocol = /<\/?stsc_(?:self_check|previous_review|response)\b/i.test(original)
         || /&lt;\s*\/?\s*stsc_(?:self_check|previous_review|response)\b/i.test(original);
     // 普通Markdown代码块属于用户正文。只有插件协议确实位于整段围栏内时，才移除外层围栏以兼容模型输出。
-    let source = containsPluginProtocol
-        ? original
-            .replace(/^\s*```(?:xml)?\s*/i, '')
-            .replace(/\s*```\s*$/i, '')
-            .trim()
-        : original;
+    let source = original;
+    if (containsPluginProtocol) {
+        const trimmed = original.trim();
+        const opening = /^(`{3,})[ \t]*(?:xml)?[ \t]*(?:\r\n|\n|\r)/i.exec(trimmed);
+        if (opening) {
+            const inner = trimmed.slice(opening[0].length);
+            // The FIRST matching closing line must end the entire response.
+            // Otherwise these fences belong to ordinary body blocks, not one outer wrapper.
+            const closing = new RegExp('^[ \\t]*`{' + opening[1].length + ',}[ \\t]*(?=\\r?$)', 'm').exec(inner);
+            if (closing && !inner.slice(closing.index + closing[0].length).trim()) {
+                source = inner.slice(0, closing.index).trim();
+            }
+        }
+    }
     let decodedOuterXml = false;
     if (!STSC_CHECK_OPEN_RE.test(source) && /&lt;\s*stsc_self_check\b/i.test(source)) {
         source = decodeXmlEntities(source).trim();
@@ -4781,8 +5319,10 @@ function renderPresetsTab() {
 function renderReferencesTab() {
     const settings = getUiSettings();
     const entity = getCurrentEntity();
-    const references = settings.references.length
-        ? settings.references.map(reference => {
+    const groups = referenceGroupsForUi(settings);
+    if (referenceGroupFilter !== null && !groups.some(group => group.id === referenceGroupFilter)) referenceGroupFilter = null;
+    const renderCards = items => items.length
+        ? items.map((reference, index) => {
             const expanded = expandedReferenceIds.has(reference.id);
             const config = referenceTypeConfig(reference.type);
             const questionDisabled = !reference.enabled;
@@ -4801,8 +5341,14 @@ function renderReferencesTab() {
                         <input type="checkbox" data-reference-field="enabled" ${reference.enabled ? 'checked' : ''}>
                         <span>${reference.enabled ? '已启用' : '未启用'}</span>
                     </label>
+                    <div class="stsc-reference-order-actions">
+                        <button class="menu_button stsc-small-button stsc-icon-action" type="button" data-action="move-reference-up" title="上移资料及自检问题" aria-label="上移资料及自检问题" ${index === 0 ? 'disabled' : ''}><i class="fa-solid fa-arrow-up" aria-hidden="true"></i><span class="stsc-action-label">上移</span></button>
+                        <button class="menu_button stsc-small-button stsc-icon-action" type="button" data-action="move-reference-down" title="下移资料及自检问题" aria-label="下移资料及自检问题" ${index === items.length - 1 ? 'disabled' : ''}><i class="fa-solid fa-arrow-down" aria-hidden="true"></i><span class="stsc-action-label">下移</span></button>
+                    </div>
                 </div>
 
+                <label class="checkbox_label" style="padding:8px 12px"><input type="checkbox" data-reference-field="sendToMain" ${reference.sendToMain === true ? 'checked' : ''}> 发送原文给正文模型（默认关闭）</label>
+                <label class="stsc-reference-group-picker">所属分组 <select class="text_pole" data-reference-field="groupId" aria-label="移动${escapeHtml(reference.name)}到分组">${referenceGroupOptions(reference.groupId || '', settings)}</select></label>
                 <div class="stsc-reference-body">
                     <div class="stsc-grid-2">
                         <div class="stsc-field">
@@ -4823,7 +5369,7 @@ function renderReferencesTab() {
 
                     <div class="stsc-field" style="margin-top:9px">
                         <label>${config.label}内容</label>
-                        <textarea class="text_pole stsc-textarea" data-reference-field="content" placeholder="在这里填写要注入给 AI 的完整资料内容">${escapeHtml(reference.content)}</textarea>
+                        <textarea class="text_pole stsc-textarea" data-reference-field="content" placeholder="在这里填写供自检API参考的完整资料内容">${escapeHtml(reference.content)}</textarea>
                     </div>
 
                     <div class="stsc-grid-2" style="margin-top:9px">
@@ -4872,13 +5418,13 @@ function renderReferencesTab() {
                     <div class="stsc-reference-question-section ${questionDisabled ? 'is-disabled' : ''}">
                         <label class="checkbox_label">
                             <input type="checkbox" data-reference-field="addToCheck" ${reference.addToCheck ? 'checked' : ''} ${questionDisabled ? 'disabled' : ''}>
-                            自动加入自检问答末尾
+                            单API：自动加入自检问答末尾
                         </label>
-                        <div class="stsc-muted">${questionDisabled ? '请先启用这个资料库，才能启用对应的自检问题。' : '启用后，AI 会先看到资料内容，再回答下面的自检问题。'}</div>
+                        <div class="stsc-muted">${questionDisabled ? '请先启用这个资料库，才能启用对应的自检问题。' : '仅单API且发送原文时使用；双API始终把启用资料作为公共参考，不追加这道题。'}</div>
                         <div class="stsc-field" style="margin-top:8px">
-                            <label>自动生成的自检问题（可修改）</label>
+                            <label>单API资料自检问题（双API不使用）</label>
                             <textarea class="text_pole" data-reference-field="autoQuestion">${escapeHtml(reference.autoQuestion)}</textarea>
-                            <div class="stsc-muted">可使用 {{name}} 代表资料库名称。该问题固定要求提供依据。</div>
+                            <div class="stsc-muted">可使用 {{name}} 代表资料库名称。该问题固定要求提供依据；双API不使用此题。</div>
                         </div>
                     </div>
 
@@ -4889,19 +5435,36 @@ function renderReferencesTab() {
                 </div>
             </div>`;
         }).join('')
-        : '<div class="stsc-empty">资料库还是空的。</div>';
+        : '<div class="stsc-empty">此分组还没有资料，可点击“移入资料”，或新建资料后选择此分组。</div>';
+    const references = groups.filter(group => referenceGroupFilter === null || group.id === referenceGroupFilter).map(group => {
+        const members = settings.references.filter(reference => (reference.groupId || '') === group.id);
+        const collapsed = collapsedReferenceGroupIds.has(group.id);
+        return `<section class="stsc-reference-group" data-library-group-id="${escapeHtml(group.id)}">
+            <div class="stsc-reference-group-header"><button class="stsc-reference-group-toggle" type="button" data-reference-group-action="toggle" data-group-id="${escapeHtml(group.id)}" aria-expanded="${!collapsed}">${collapsed ? '▸' : '▾'} ${escapeHtml(group.name)} <span>（${members.length}条）</span></button>
+                <div class="stsc-reference-group-actions"><button class="menu_button stsc-small-button" type="button" data-reference-group-action="move" data-group-id="${escapeHtml(group.id)}">移入资料</button>
+                ${group.id ? `<button class="menu_button stsc-small-button" type="button" data-reference-group-action="rename" data-group-id="${escapeHtml(group.id)}">改名</button><button class="menu_button stsc-small-button stsc-danger-button" type="button" data-reference-group-action="delete" data-group-id="${escapeHtml(group.id)}">删除分组</button>` : ''}</div></div>
+            <div class="stsc-reference-group-content" ${collapsed ? 'hidden' : ''}>${renderCards(members)}</div></section>`;
+    }).join('');
 
     $('#stsc_tab_references').html(`
         <div class="stsc-section">
             <div class="stsc-section-title">参考资料库</div>
+            <div class="stsc-toolbar"><button class="menu_button" type="button" data-action="open-reference-plans">资料方案</button>
+                <span class="stsc-muted">当前使用：${escapeHtml(getEffectiveReferencePlan(settings)?.name || '总资料库原有配置')}</span></div>
             <div class="stsc-muted">像世界书一样保存文风、强制限制或其他长期资料。所有资料默认折叠；只有启用资料库后，才能开启它对应的自检问题。</div>
+            <div class="stsc-muted">使用每条资料右侧的上移／下移调整顺序，关联自检问题会同步排序；点击“保存更改”后生效。不改变通用、角色与资料问题的分组顺序。</div>
+            <div class="stsc-muted">绑定资料方案后，资料启停、顺序与自检问答按方案配置生效；下面总库的启停与角色范围仅在未使用方案时生效，内容编辑仍会同步到所有方案。</div>
             <div class="stsc-toolbar stsc-reference-action-toolbar" style="margin-top:9px">
+                <button class="menu_button" type="button" data-reference-group-action="new">新建分组</button>
                 <button class="menu_button stsc-compact-action" type="button" data-action="open-create-reference" title="新建资料库" aria-label="新建资料库"><i class="fa-solid fa-plus"></i><span class="stsc-action-label">新建资料库</span></button>
                 <button class="menu_button stsc-compact-action" type="button" data-action="batch-export-references" title="批量导出资料库" aria-label="批量导出资料库" ${settings.references.length ? '' : 'disabled'}><i class="fa-solid fa-box-archive"></i><span class="stsc-action-label">批量导出</span></button>
                 <button class="menu_button stsc-compact-action" type="button" data-action="import-reference" title="导入资料库或资料库合集" aria-label="导入资料库或资料库合集"><i class="fa-solid fa-file-import"></i><span class="stsc-action-label">导入资料库</span></button>
+                <button class="menu_button" type="button" data-action="import-reference-source">从预设／世界书导入</button>
                 <input id="stsc_reference_import_file" class="stsc-file-input" type="file" accept=".json,.stsc-reference.json,.stsc-references.json,application/json" aria-label="选择要导入的参考资料库文件或合集文件">
             </div>
             <div class="stsc-muted" style="margin-top:8px">支持导入单个资料库或一次导入整个资料库合集。导入内容默认保持关闭，角色绑定不会随文件导入；请展开检查后再手动启用。</div>
+            <div class="stsc-field stsc-reference-group-filter"><label for="stsc_reference_group_filter">查看分组</label><select id="stsc_reference_group_filter" class="text_pole"><option value="*" ${referenceGroupFilter === null ? 'selected' : ''}>全部分组</option>${referenceGroupOptions(referenceGroupFilter, settings)}</select></div>
+            <div class="stsc-muted">分组仅用于整理，不决定启用状态或发送顺序。条目上移／下移在组内调整；资料方案仍使用自己的顺序。删除分组只把资料移回默认分组。分组修改需点击顶部“保存更改”。</div>
             <div class="stsc-reference-list">${references}</div>
         </div>
     `);
@@ -5062,8 +5625,8 @@ function renderSettingsTab() {
             <details class="stsc-api-group" data-channel-id="generation-options" ${expandedApiChannelIds.has("generation-options") ? "open" : ""}><summary><b>3. 自检参数与失败处理</b> · 每模型${perModelAttemptLimit(dual)}次 · ${dual.failureMode === "stop" ? "失败停止" : "主模型接管"}</summary>
             <div class="stsc-grid-3" style="margin-top:10px">
                 <div class="stsc-field">
-                    <label>自检最大回复长度</label>
-                    <input id="stsc_dual_max_tokens" class="text_pole" type="number" min="256" max="12000" step="128" value="${Math.round(dual.maxTokens)}">
+                    <label>自检最大回复长度（新配置默认8192）</label>
+                    <input id="stsc_dual_max_tokens" class="text_pole" type="number" min="256" max="12000" step="128" value="${Math.round(dual.maxTokens)}"><button class="menu_button" type="button" data-action="set-self-check-8192">设为8192</button>
                     <div class="stsc-muted">单位：Token</div>
                 </div>
                 <div class="stsc-field">
@@ -5134,7 +5697,7 @@ function renderSettingsTab() {
                 </div>
                 <div class="stsc-dual-library-note">
                     <b>资料库在双API模式下</b>
-                    <span>资料库自动问题会改成“自包含规则型问题”，要求自检API说清楚正文具体该怎么写、怎么遵照；酒馆主API即使没有直接读取资料原文，也能看懂答案。</span>
+                    <span>启用的资料由自检API统一参考，不逐份追加资料复述题。默认不向正文模型注入资料原文；正文若也需要这些规则，请挂载世界书或明确开启该资料的“发送原文给正文模型”。</span>
                 </div>
             </div>
             <div class="stsc-toolbar" style="margin-top:12px">
@@ -5602,6 +6165,8 @@ function openDialog(title, bodyHtml, footerHtml = '') {
 
 function closeDialog() {
     const hadPendingUnsavedAction = Boolean(pendingUnsavedAction);
+    referencePlanDialogState = null;
+    referenceSourceDialogState = null;
     bulkDraft = null;
     pendingUnsavedAction = null;
     pendingDeleteRequest = null;
@@ -5837,6 +6402,7 @@ function makeReferenceExportPayload(reference) {
             name: reference.name,
             type: reference.type,
             content: reference.content,
+            sendToMain: reference.sendToMain === true,
             enabled: Boolean(reference.enabled),
             scope: reference.scope,
             position: reference.position,
@@ -5938,11 +6504,13 @@ function validateImportedReferenceRecord(reference) {
     if (!Number.isInteger(reference.depth) || reference.depth < 0 || reference.depth > 20) throw new Error(`资料库“${name}”的注入深度不正确。`);
     if (!['system', 'user', 'assistant'].includes(reference.role)) throw new Error(`资料库“${name}”的注入角色不正确。`);
     if (typeof reference.addToCheck !== 'boolean') throw new Error(`资料库“${name}”的自动问题状态格式不正确。`);
+    if (reference.sendToMain !== undefined && typeof reference.sendToMain !== 'boolean') throw new Error('资料库发送原文开关格式不正确。');
     if (typeof reference.autoQuestion !== 'string' || reference.autoQuestion.length > 10000) throw new Error(`资料库“${name}”的自动问题格式不正确。`);
     return {
         name,
         type: reference.type,
         content: reference.content,
+        sendToMain: reference.sendToMain === true,
         scope: reference.scope,
         position: reference.position,
         depth: reference.depth,
@@ -5997,6 +6565,7 @@ async function importReferenceFile(file) {
             const uniqueName = makeUniqueReferenceName(imported.name);
             const reference = createReference(uniqueName, imported.type);
             reference.content = imported.content;
+            reference.sendToMain = imported.sendToMain === true;
             reference.scope = imported.scope;
             reference.position = imported.position;
             reference.depth = imported.depth;
@@ -6013,6 +6582,7 @@ async function importReferenceFile(file) {
             if (imported.scope === 'character') containsCharacterScope = true;
         }
 
+        revealReferenceGroup(created[0]?.id, settings);
         markDirty();
         renderAll();
 
@@ -6048,6 +6618,10 @@ function openCreateReferenceDialog() {
         `<div class="stsc-field">
             <label>资料库名称</label>
             <input id="stsc_new_reference_name" class="text_pole" type="text" maxlength="80" placeholder="请输入不重复的资料库名称">
+        </div>
+        <div class="stsc-field" style="margin-top:10px">
+            <label for="stsc_new_reference_group">所属分组</label>
+            <select id="stsc_new_reference_group" class="text_pole">${referenceGroupOptions(referenceGroupFilter || '', getUiSettings())}</select>
         </div>
         <div class="stsc-field" style="margin-top:10px">
             <label>资料类型</label>
@@ -6389,6 +6963,10 @@ function bindUiEvents() {
         if (!reference) return;
         const field = $(this).data('reference-field');
 
+        if (field === 'groupId') {
+            moveReferencesToGroup([id], this.value); markDirty(); renderReferencesTab(); return;
+        }
+        if (field === 'sendToMain') { reference.sendToMain = this.checked; markDirty(); return; }
         if (field === 'name') {
             const nextName = String(this.value || '').trim();
             const $error = $card.find('[data-reference-name-error]');
@@ -6658,7 +7236,7 @@ function bindUiEvents() {
         updateSaveState();
     });
     $('#stsc_manager_overlay').on('change', '#stsc_dual_max_tokens', function () {
-        getUiSettings().dualApi.maxTokens = clampNumber(this.value, 256, 12000, 4096);
+        getUiSettings().dualApi.maxTokens = clampNumber(this.value, 256, 12000, 8192);
         this.value = Math.round(getUiSettings().dualApi.maxTokens);
         markDirty();
     });
@@ -6792,6 +7370,10 @@ function bindUiEvents() {
         } else if (action === 'open-create-preset') {
             openCreatePresetDialog($(this).data('kind'));
             return;
+        } else if (action === 'open-reference-plans') {
+            renderReferencePlansDialog(); return;
+        } else if (action === 'import-reference-source') {
+            openReferenceSourceDialog(); return;
         } else if (action === 'open-create-reference') {
             openCreateReferenceDialog();
             return;
@@ -6914,6 +7496,8 @@ function bindUiEvents() {
         } else if (action === 'test-preset') {
             await testCurrentPreset();
             return;
+        } else if (action === 'set-self-check-8192') {
+            settings.dualApi.maxTokens = 8192; markDirty(); renderSettingsTab(); return;
         } else if (action === 'test-dual-api-self-check') {
             await testDualApiSelfCheckOnly();
             return;
@@ -6950,6 +7534,10 @@ function bindUiEvents() {
             const reference = settings.references.find(item => item.id === id);
             downloadReferenceFile(reference);
             return;
+        } else if (action === 'move-reference-up' || action === 'move-reference-down') {
+            const id = String($(this).closest('[data-reference-id]').data('reference-id'));
+            if (moveReferenceInGroup(id, action === 'move-reference-up' ? -1 : 1, settings)) markDirty();
+            renderReferencesTab(); return;
         } else if (action === 'delete-reference') {
             const id = $(this).closest('[data-reference-id]').data('reference-id');
             const reference = settings.references.find(item => item.id === id);
@@ -6957,9 +7545,10 @@ function bindUiEvents() {
             openDeleteConfirmation({
                 title: '确认删除资料库',
                 message: `确定删除资料库“${reference.name}”吗？`,
-                detail: `类型：${referenceTypeLabel(reference.type)}。资料内容与关联的自动自检问题都会一起删除。`,
+                detail: `类型：${referenceTypeLabel(reference.type)}。资料内容与关联的自动自检问题都会一起删除；也会从所有引用它的资料方案中移除。`,
                 perform: () => {
                     settings.references = settings.references.filter(item => item.id !== id);
+                    for (const plan of settings.referencePlans) plan.entries = plan.entries.filter(entry => entry.referenceId !== id);
                     expandedReferenceIds.delete(id);
                     markDirty();
                     renderAll();
@@ -7113,6 +7702,8 @@ function bindUiEvents() {
             openExtensionManagerForUpdate();
             return;
         }
+        if (action === 'confirm-reference-source') { confirmReferenceSourceImport(); return; }
+        if (action === 'retry-reference-source-book') { const state = referenceSourceDialogState; if (state?.failed) void selectReferenceSourceBook(String(state.bookIndex)); return; }
         if (action === 'copy-diagnostic') { void copyDiagnostic(); return; }
         if (action === 'copy-latest-diagnostic') { void copyDiagnostic(true); return; }
         if (action === 'view-log-detail') {
@@ -7219,7 +7810,9 @@ function bindUiEvents() {
                 return;
             }
             const reference = createReference(name, type);
+            reference.groupId = String($('#stsc_new_reference_group').val() || '');
             settings.references.push(reference);
+            revealReferenceGroup(reference.id, settings);
             markDirty();
             closeDialog();
             renderAll();
@@ -7719,7 +8312,7 @@ async function initialize() {
     addExtensionsMenuButton();
     const events = context.eventTypes || context.event_types;
     context.eventSource.on(events.MESSAGE_RECEIVED, handleMessageReceived);
-    context.eventSource.on(events.CHAT_CHANGED, () => { if (pendingRun || dualApiBusy || testBusy) onGenerationStopped(); renderAll(); });
+    context.eventSource.on(events.CHAT_CHANGED, () => { if (pendingRun || dualApiBusy || testBusy) onGenerationStopped(); onReferencePlanChatChanged(); });
     if (events.CHAT_COMPLETION_SETTINGS_READY) context.eventSource.on(events.CHAT_COMPLETION_SETTINGS_READY, captureRealRequest);
     context.eventSource.on(events.GENERATION_ENDED, onGenerationEnded);
     context.eventSource.on(events.GENERATION_STOPPED, onGenerationStopped);

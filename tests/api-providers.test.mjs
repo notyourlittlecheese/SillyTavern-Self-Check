@@ -247,3 +247,9 @@ test('explicit safety refusals are terminal in JSON and streamed responses', asy
     assert.equal(isExplicitSafetyRefusal('<stsc_self_check><answer>I cannot fulfill this request because safety guidelines prohibit it.</answer></stsc_self_check>'),false);
     assert.equal(isExplicitSafetyRefusal('I cannot provide a connection because the server is down.'),false);
 });
+
+test('default generation token budget is 8192 without replacing explicit saved values', () => {
+    const base={provider:'custom',endpoint:'https://example.test/v1',model:'example'};
+    assert.equal(JSON.parse(buildGenerationRequest(base,[]).custom_include_body).max_tokens,8192);
+    assert.equal(JSON.parse(buildGenerationRequest({...base,maxTokens:4096},[]).custom_include_body).max_tokens,4096);
+});
