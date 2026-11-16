@@ -248,8 +248,15 @@ test('explicit safety refusals are terminal in JSON and streamed responses', asy
     assert.equal(isExplicitSafetyRefusal('I cannot provide a connection because the server is down.'),false);
 });
 
-test('default generation token budget is 8192 without replacing explicit saved values', () => {
+test('default generation token budget is omitted without replacing explicit saved values', () => {
     const base={provider:'custom',endpoint:'https://example.test/v1',model:'example'};
-    assert.equal(JSON.parse(buildGenerationRequest(base,[]).custom_include_body).max_tokens,8192);
+    assert.equal(JSON.parse(buildGenerationRequest(base,[]).custom_include_body).max_tokens,undefined);
     assert.equal(JSON.parse(buildGenerationRequest({...base,maxTokens:4096},[]).custom_include_body).max_tokens,4096);
+});
+
+test('zero omits both OpenAI token limits and native Gemini limit, positive limits have no plugin cap', () => {
+ for (const id of ['custom','openai']) { const r=buildGenerationRequest(config(id,{maxTokens:0}),[]);assert.deepEqual(JSON.parse(r.custom_include_body),{});for(const key of ['max_tokens','max_completion_tokens'])assert.ok(JSON.parse(r.custom_exclude_body).includes(key)); }
+ assert.equal(buildGenerationRequest(config('gemini',{maxTokens:0}),[]).max_tokens,undefined);
+ assert.throws(()=>buildGenerationRequest(config('claude',{maxTokens:0}),[]),/正数/);
+ assert.equal(JSON.parse(buildGenerationRequest(config('custom',{maxTokens:65536}),[]).custom_include_body).max_tokens,65536);
 });

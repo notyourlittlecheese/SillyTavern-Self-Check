@@ -1120,10 +1120,10 @@ test('reuse confirmation dismissal, stop or chat switch never sends a request', 
     }
 });
 
-test('new token budget defaults to 8192 while saved explicit budgets remain intact', () => {
-    const h=harness();assert.equal(h.run('DEFAULT_SETTINGS.dualApi.maxTokens'),8192);
+test('new token budget defaults to zero while saved explicit budgets remain intact', () => {
+    const h=harness();assert.equal(h.run('DEFAULT_SETTINGS.dualApi.maxTokens'),0);
     h.run('normalizeSettings=realNormalizeSettings;normalizeSettings()');assert.equal(h.settings.dualApi.maxTokens,4096);
-    delete h.settings.dualApi.maxTokens;h.run('normalizeSettings()');assert.equal(h.settings.dualApi.maxTokens,8192);
+    delete h.settings.dualApi.maxTokens;h.run('normalizeSettings()');assert.equal(h.settings.dualApi.maxTokens,0);
 });
 
 test('references default to reviewer-only, stay in reviewer context and do not add dual questions', () => {

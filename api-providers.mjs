@@ -86,7 +86,8 @@ function validated(config, needsModel = false) {
 
 export function buildGenerationRequest(config, messages) {
     const { id, provider, endpoint, key, model } = validated(config, true);
-    const limit = Math.round(Math.min(12000, Math.max(256, Number(config.maxTokens) || 8192)));
+    const limit = Math.round(Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Number(config.maxTokens) || 0)));
+    if (provider.protocol === 'claude' && !limit) throw new Error('原生Claude接口要求输出额度为正数，请填写例如20000或该模型支持的值。');
     const common = { type: 'quiet', messages, model, stream: false };
     if (provider.protocol === 'claude') {
         return { ...common, chat_completion_source: 'claude', reverse_proxy: endpoint,
@@ -94,18 +95,18 @@ export function buildGenerationRequest(config, messages) {
     }
     if (provider.protocol === 'gemini') {
         return { ...common, chat_completion_source: 'makersuite', reverse_proxy: endpoint,
-            proxy_password: key, max_tokens: limit, use_sysprompt: true, use_makersuite_sysprompt: true,
+            proxy_password: key, ...(limit ? { max_tokens: limit } : {}), use_sysprompt: true, use_makersuite_sysprompt: true,
             include_reasoning: false, enable_web_search: false };
     }
     // The custom backend avoids ST's model-name heuristics and preserves Plan paths.
     // Explicitly override Authorization so the main API's saved key is never borrowed.
-    const body = id === 'openai' ? { max_completion_tokens: limit } : { max_tokens: limit };
+    const body = !limit ? {} : id === 'openai' ? { max_completion_tokens: limit } : { max_tokens: limit };
     return { ...common, chat_completion_source: 'custom', custom_url: endpoint,
         custom_include_headers: JSON.stringify({ Authorization: key ? 'Bearer ' + key : '' }),
         custom_include_body: JSON.stringify(body),
         // No temperature/top_p penalties: many reasoning models reject these.
         custom_exclude_body: JSON.stringify(['temperature', 'top_p', 'top_k', 'presence_penalty', 'frequency_penalty',
-            id === 'openai' ? 'max_tokens' : 'max_completion_tokens']) };
+            ...(!limit ? ['max_tokens', 'max_completion_tokens'] : [id === 'openai' ? 'max_tokens' : 'max_completion_tokens'])]) };
 }
 
 export function buildModelsRequest(config) {
