@@ -1260,3 +1260,12 @@ test('reference management dialogs render plans, grouping and world import with 
     assert.ok(dialogs.some(d=>d[1].includes('stsc_reference_group_name')));
     assert.ok(dialogs.some(d=>d[1].includes('data-reference-source-entry="0"')));
 });
+
+test('shared channel catalog unions discovery without changing preset candidates or parameters', () => {
+ const h=harness(); h.run(`settings.presets=[{id:'a',kind:'general',apiConfig:capturePresetApiConfig(settings)},{id:'b',kind:'general',apiConfig:{mode:'dual_api',dualApi:{...structuredClone(settings.dualApi),endpoint:'https://other.test/v1',models:['other'],model:'other',maxTokens:20000}}}];settings.generalPresetId='a';settings.apiConfigPresetId='a';syncPresetApiConfig(settings);`);
+ assert.equal(h.settings.dualApi.fallbacks.length,1);assert.equal(h.settings.dualApi.fallbacks[0].enabled,false);assert.equal(h.settings.dualApi.fallbacks[0].models.length,0);assert.deepEqual(Array.from(h.settings.dualApi.fallbacks[0].availableModels),['other']);
+ assert.deepEqual(Array.from(h.settings.dualApi.models),['first','second','third']);assert.equal(h.settings.presets[1].apiConfig.dualApi.maxTokens,20000);
+ h.run(`settings.presets[1].apiConfig.dualApi.fallbacks[0].models=['new-model'];syncPresetApiConfig(settings)`);assert.ok(h.settings.dualApi.availableModels.includes('new-model'));assert.ok(!h.settings.dualApi.models.includes('new-model'));
+ const before=JSON.stringify(h.settings);h.run('syncPresetApiConfig(settings)');assert.equal(JSON.stringify(h.settings),before);
+ h.run(`settings.dualApi.fallbacks.push({...structuredClone(settings.dualApi.fallbacks[0]),id:'different-key',apiKey:'other-key'});syncPresetApiConfig(settings)`);assert.equal(h.settings.apiChannelCatalog.length,3);
+});
